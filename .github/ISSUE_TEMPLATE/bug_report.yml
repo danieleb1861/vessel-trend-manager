@@ -1,0 +1,53 @@
+name: Bug report
+description: Something does not work as described.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not attach real archives (`.s3db`), preferences, logs or screenshots of real vessel data.**
+        Reproduce with the synthetic demo (`--demo` or the **Try demo** button) whenever possible.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Observed behavior and the exact error message, if any.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Press Try demo
+        2. Select Weekly, Full history
+        3. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: data
+    attributes:
+      label: Data used
+      options:
+        - Synthetic demo
+        - Own archives (described below without real values)
+    validations:
+      required: true
+  - type: textarea
+    id: schema
+    attributes:
+      label: Archive layout (only if not the demo)
+      description: Anonymized table/column names and file names. No real tag names, values or vessel identity.
+  - type: input
+    id: version
+    attributes:
+      label: Version and Windows build
+      placeholder: "e.g. 0.2.0, Windows 11 24H2"
+    validations:
+      required: true

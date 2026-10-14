@@ -1,0 +1,30 @@
+[package]
+name = "vessel-trend-manager"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Offline trend viewer for ship machinery archives (AMS SQLite exports)"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "VesselTrendManager"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+egui_plot = "0.34"
+image = { version = "0.25", default-features = false, features = ["png"] }
+rfd = "0.15"
+rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[build-dependencies]
+winresource = "0.1"
+
