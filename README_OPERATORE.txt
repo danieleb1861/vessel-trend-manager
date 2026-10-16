@@ -87,6 +87,11 @@ e segue zoom e spostamenti:
 - Misura: clic destro su una lettura (A) e su una seconda (B) per leggere
   intervallo di tempo, variazione e variazione all'ora. I punti sono letture
   registrate, mai valori calcolati. La x cancella la misura.
+- Anomalie (parametri analogici): un modello Isolation Forest, addestrato
+  sulle letture caricate di quel parametro (valore e variazione all'ora),
+  cerchia in rosso lo 0,5% di letture piu insolite tra quelle disegnate.
+  E un'indicazione da approfondire, non un allarme: non conosce i limiti e
+  impara da cio che e stato caricato, compresi eventuali guasti.
 - Esporta CSV: salva le letture raw visibili (data e ora, valore, unita,
   validita, allarme, inibizione, file e riga) in un file per Excel, separato
   da punto e virgola, con la virgola decimale in italiano. Scegliere un nome

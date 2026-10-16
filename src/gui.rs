@@ -9,10 +9,10 @@ use crate::{
 };
 use chrono::{DateTime, Duration as Span};
 use eframe::egui::{self, Color32, RichText, Stroke};
-use egui_plot::{Bar, BarChart, Line, Plot, Points, Polygon, VLine};
+use egui_plot::{Bar, BarChart, Line, MarkerShape, Plot, Points, Polygon, VLine};
 use serde::{Deserialize, Serialize};
 use std::{
-    cell::{Cell, RefCell},
+    cell::{Cell, OnceCell, RefCell},
     collections::BTreeMap,
     fs,
     io::{Read, Write},
@@ -344,6 +344,8 @@ fn lines(
     }
     segments
 }
+/// Shown x range and plot width in pixels.
+type ViewKey = (f64, f64, usize);
 struct CachedPlot {
     points: Vec<Sample>,
     segments: Vec<Vec<[f64; 2]>>,
@@ -352,6 +354,11 @@ struct CachedPlot {
     view: RefCell<Option<RawView>>,
     /// Histogram of the shown range opened under the chart.
     histogram: Cell<bool>,
+    /// Isolation Forest of this series and its flagging score, trained on first request.
+    forest: OnceCell<Option<(Forest, f64)>>,
+    /// Unusual readings among those drawn, for the view they were computed for.
+    unusual: RefCell<Option<(ViewKey, Vec<usize>)>>,
+    show_unusual: Cell<bool>,
     /// Readings picked with a right click for a measure, as indices into `Series::raw`.
     marks: Cell<[Option<usize>; 2]>,
 }
@@ -381,6 +388,9 @@ impl CachedPlot {
             bars,
             view: RefCell::new(None),
             histogram: Cell::new(false),
+            forest: OnceCell::new(),
+            unusual: RefCell::new(None),
+            show_unusual: Cell::new(false),
             marks: Cell::new([None; 2]),
         }
     }
@@ -577,6 +587,217 @@ fn time_label(value: f64, format: &str) -> String {
     DateTime::from_timestamp(value as i64, 0)
         .map(|t| t.format(format).to_string())
         .unwrap_or_default()
+}
+const FOREST_TREES: usize = 100;
+const FOREST_SUBSAMPLE: usize = 256;
+const FOREST_SHARE: f64 = 0.005;
+const FOREST_SEED: u64 = 0x5EED_F0E5_7000_0001;
+/// Isolation Forest (Liu, Ting and Zhou, 2008) over [value, change per hour]. It flags
+/// statistically unusual readings for exploration; it is not an alarm and knows no limits.
+struct Forest {
+    trees: Vec<Vec<Node>>,
+    /// Average path length c(psi) of an unsuccessful search, used to normalise.
+    norm: f64,
+}
+/// Tree node in a flat vector; a leaf keeps the number of training samples it holds.
+enum Node {
+    Split {
+        feature: usize,
+        at: f64,
+        left: usize,
+        right: usize,
+    },
+    Leaf(usize),
+}
+impl Forest {
+    fn train(samples: &[[f64; 2]], trees: usize, subsample: usize, seed: u64) -> Self {
+        let finite: Vec<[f64; 2]> = samples
+            .iter()
+            .copied()
+            .filter(|s| s.iter().all(|v| v.is_finite()))
+            .collect();
+        let psi = subsample.min(finite.len());
+        let mut forest = Self {
+            trees: Vec::new(),
+            norm: Self::average_path(psi),
+        };
+        if psi < 2 {
+            return forest;
+        }
+        let limit = (psi as f64).log2().ceil() as usize;
+        let mut state = seed;
+        let mut order: Vec<usize> = (0..finite.len()).collect();
+        let mut points = Vec::with_capacity(psi);
+        for _ in 0..trees {
+            // Partial Fisher-Yates: the first psi entries are drawn without replacement.
+            for i in 0..psi {
+                let j = i + Self::below(&mut state, finite.len() - i);
+                order.swap(i, j);
+            }
+            points.clear();
+            points.extend(order[..psi].iter().map(|&i| finite[i]));
+            let mut nodes = Vec::with_capacity(2 * psi);
+            Self::grow(&mut nodes, &mut points, 0, limit, &mut state);
+            forest.trees.push(nodes);
+        }
+        forest
+    }
+    /// Anomaly score in (0, 1]: near 1 is easy to isolate, 0.5 or less is ordinary.
+    fn score(&self, x: [f64; 2]) -> f64 {
+        if self.trees.is_empty() || !x.iter().all(|v| v.is_finite()) {
+            return 0.5;
+        }
+        let total: f64 = self
+            .trees
+            .iter()
+            .map(|nodes| {
+                let (mut id, mut depth) = (0, 0.0);
+                loop {
+                    match nodes[id] {
+                        Node::Split {
+                            feature,
+                            at,
+                            left,
+                            right,
+                        } => {
+                            id = if x[feature] < at { left } else { right };
+                            depth += 1.0;
+                        }
+                        Node::Leaf(size) => break depth + Self::average_path(size),
+                    }
+                }
+            })
+            .sum();
+        2f64.powf(-total / self.trees.len() as f64 / self.norm)
+    }
+    fn grow(
+        nodes: &mut Vec<Node>,
+        points: &mut [[f64; 2]],
+        depth: usize,
+        limit: usize,
+        state: &mut u64,
+    ) -> usize {
+        let id = nodes.len();
+        nodes.push(Node::Leaf(points.len()));
+        if depth >= limit || points.len() <= 1 {
+            return id;
+        }
+        let range = |f: usize| {
+            points
+                .iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+                    (lo.min(p[f]), hi.max(p[f]))
+                })
+        };
+        let ranges = [range(0), range(1)];
+        // Only a feature that still varies can split the node.
+        let spread: Vec<usize> = (0..2).filter(|&f| ranges[f].1 > ranges[f].0).collect();
+        if spread.is_empty() {
+            return id;
+        }
+        let feature = spread[Self::below(state, spread.len())];
+        let (lo, hi) = ranges[feature];
+        let at = lo + Self::unit(state) * (hi - lo);
+        let mut split = 0;
+        for i in 0..points.len() {
+            if points[i][feature] < at {
+                points.swap(i, split);
+                split += 1;
+            }
+        }
+        let (low, high) = points.split_at_mut(split);
+        let left = Self::grow(nodes, low, depth + 1, limit, state);
+        let right = Self::grow(nodes, high, depth + 1, limit, state);
+        nodes[id] = Node::Split {
+            feature,
+            at,
+            left,
+            right,
+        };
+        id
+    }
+    /// c(n) = 2 H(n - 1) - 2 (n - 1) / n, with c(1) = 0 and c(2) = 1.
+    fn average_path(n: usize) -> f64 {
+        match n {
+            0 | 1 => 0.0,
+            2 => 1.0,
+            _ => {
+                let n = n as f64;
+                2.0 * ((n - 1.0).ln() + 0.5772156649) - 2.0 * (n - 1.0) / n
+            }
+        }
+    }
+    /// SplitMix64, so the same seed always grows the same forest.
+    fn random(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    /// Uniform in [0, 1).
+    fn unit(state: &mut u64) -> f64 {
+        (Self::random(state) >> 11) as f64 / (1u64 << 53) as f64
+    }
+    /// Uniform in 0..n for n > 0.
+    fn below(state: &mut u64, n: usize) -> usize {
+        ((u128::from(Self::random(state)) * n as u128) >> 64) as usize
+    }
+}
+/// Valid readings whose previous reading is valid and earlier, as (index, [value, change
+/// per hour]). Readings without such a predecessor are not scored.
+fn reading_features(raw: &[Raw]) -> Vec<(usize, [f64; 2])> {
+    raw.windows(2)
+        .enumerate()
+        .filter_map(|(i, w)| match measure(&w[0], &w[1]) {
+            (elapsed, _, Some(rate)) if elapsed > 0 && w[0].good() && w[1].good() => {
+                Some((i + 1, [w[1].value, rate]))
+            }
+            _ => None,
+        })
+        .collect()
+}
+/// Score above which at most `share` of the given scores lie.
+fn threshold(scores: &[f64], share: f64) -> f64 {
+    let mut sorted: Vec<f64> = scores.iter().copied().filter(|s| !s.is_nan()).collect();
+    if sorted.is_empty() {
+        return f64::INFINITY;
+    }
+    sorted.sort_unstable_by(f64::total_cmp);
+    let above = (share.clamp(0.0, 1.0) * sorted.len() as f64) as usize;
+    sorted[sorted.len() - 1 - above.min(sorted.len() - 1)]
+}
+/// Readings used at most to train the forest and set its score, taken at a fixed stride.
+const FOREST_SAMPLE: usize = 20_000;
+/// Forest of one signal's loaded readings with the score above which `FOREST_SHARE` of them
+/// lie; `None` with too few readings to compare.
+fn train_forest(raw: &[Raw]) -> Option<(Forest, f64)> {
+    let features = reading_features(raw);
+    if features.len() < 50 {
+        return None;
+    }
+    let sample: Vec<[f64; 2]> = features
+        .iter()
+        .step_by(features.len().div_ceil(FOREST_SAMPLE))
+        .map(|(_, f)| *f)
+        .collect();
+    let forest = Forest::train(&sample, FOREST_TREES, FOREST_SUBSAMPLE, FOREST_SEED);
+    let scores: Vec<f64> = sample.iter().map(|&f| forest.score(f)).collect();
+    let limit = threshold(&scores, FOREST_SHARE);
+    Some((forest, limit))
+}
+/// Readings among `indices` scoring above `limit`; readings without a valid predecessor are skipped.
+fn unusual_readings(raw: &[Raw], forest: &Forest, limit: f64, indices: &[usize]) -> Vec<usize> {
+    indices
+        .iter()
+        .copied()
+        .filter(|&i| {
+            i > 0
+                && reading_features(&raw[i - 1..=i])
+                    .first()
+                    .is_some_and(|(_, f)| forest.score(*f) > limit)
+        })
+        .collect()
 }
 fn dot(ui: &mut egui::Ui, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 16.0), egui::Sense::hover());
@@ -1615,6 +1836,12 @@ impl App {
                                     for line in &v.segments {plot.line(Line::new("Trend",line.clone()).color(COLORS[index]).width(1.6_f32));}
                                     plot.points(Points::new(t("Raw readings","Letture raw"),v.points.iter().map(|&i|[series.raw[i].x,series.raw[i].value]).collect::<Vec<_>>()).radius(2.2_f32).color(COLORS[index]));
                                     for (j,xs) in v.flags.iter().enumerate() {flags[j]=xs.iter().map(|&x|[x,low+(high-low)*j as f64*0.04]).collect();}
+                                    // Unusual readings among those drawn, scored again only when the view changes.
+                                    if cache.show_unusual.get() && let Some(Some((forest,limit)))=cache.forest.get() {
+                                        let mut unusual=cache.unusual.borrow_mut();
+                                        if unusual.as_ref().is_none_or(|(k,_)|*k!=v.key) {*unusual=Some((v.key,unusual_readings(&series.raw,forest,*limit,&v.points)));}
+                                        if let Some((_,found))=unusual.as_ref() {plot.points(Points::new(t("Unusual (Isolation Forest)","Insolite (Isolation Forest)"),found.iter().map(|&i|[series.raw[i].x,series.raw[i].value]).collect::<Vec<_>>()).shape(MarkerShape::Circle).filled(false).radius(6.0_f32).color(Color32::from_rgb(192,53,60)));}
+                                    }
                                 }
                                 for (name,mark) in ["A","B"].into_iter().zip(cache.marks.get()) {
                                     if let Some(r)=mark.and_then(|i|series.raw.get(i)) {plot.vline(VLine::new(name,r.x).color(INK).width(1.0_f32));}
@@ -1645,6 +1872,18 @@ impl App {
                                 if let Some((rises,falls))=s.changes {ui.small(tr!("·  state changes {} (↑ {} · ↓ {}) between consecutive valid readings","·  cambi di stato {} (↑ {} · ↓ {}) tra letture valide consecutive",rises+falls,rises,falls));}
                                 if !s.bins.is_empty() && ui.small_button(t("Histogram","Istogramma")).on_hover_text(t("Distribution of the valid readings shown","Distribuzione delle letture valide visibili")).clicked() {cache.histogram.set(!cache.histogram.get());}
                                 if ui.small_button(t("Export CSV","Esporta CSV")).on_hover_text(t("Save the raw readings shown, for Excel","Salva le letture raw visibili, per Excel")).clicked() {export=Some(index);}
+                                if series.tag.kind!="Digital" && ui.selectable_label(cache.show_unusual.get(),RichText::new(t("Unusual","Anomalie")).small()).on_hover_text(t("Isolation Forest on value and change per hour, trained on this signal's loaded readings: circles the most unusual 0.5% among those drawn. Exploratory indication, not an alarm.","Isolation Forest su valore e variazione all'ora, addestrato sulle letture caricate di questo parametro: cerchia lo 0,5% piu insolito tra quelle disegnate. Indicazione esplorativa, non un allarme.")).clicked() {
+                                    cache.show_unusual.set(!cache.show_unusual.get());
+                                    cache.forest.get_or_init(||train_forest(&series.raw));
+                                    ui.ctx().request_repaint();
+                                }
+                                if cache.show_unusual.get() {
+                                    match (cache.forest.get(),cache.unusual.borrow().as_ref()) {
+                                        (Some(None),_)=>{ui.small(t("·  too few readings for the Isolation Forest","·  troppe poche letture per l'Isolation Forest"));}
+                                        (Some(Some(_)),Some((_,found)))=>{ui.small(tr!("·  {} unusual among those drawn (exploratory)","·  {} insolite tra quelle disegnate (esplorativo)",found.len()));}
+                                        _=>{}
+                                    }
+                                }
                                 if cache.marks.get()[0].is_none() {ui.label(RichText::new(t("Right-click two readings to measure","Clic destro su due letture per misurare")).small().color(MUTED));}
                             });
                             if let [Some(a),b]=cache.marks.get() && let Some(ra)=series.raw.get(a) {
@@ -2058,6 +2297,118 @@ mod tests {
         // Zoomed to 100 readings on a 200 px plot: every raw reading in range is drawn.
         let view = RawView::new(&all, (all[50_000].x, all[50_099].x, 200), false);
         assert!((50_000..50_100).all(|i| view.points.contains(&i)));
+    }
+    fn forest_scores(all: &[Raw], seed: u64) -> Vec<(usize, f64)> {
+        let features = reading_features(all);
+        let samples: Vec<[f64; 2]> = features.iter().map(|f| f.1).collect();
+        let forest = Forest::train(&samples, FOREST_TREES, FOREST_SUBSAMPLE, seed);
+        features
+            .iter()
+            .map(|&(i, x)| (i, forest.score(x)))
+            .collect()
+    }
+    #[test]
+    fn isolation_forest_ranks_an_injected_spike_highest() {
+        // Noise keeps [value, rate] from lying on a closed ring, where every point scores ~0.5.
+        let mut state = 3;
+        let values: Vec<f64> = (0..5_000)
+            .map(|i| {
+                let noise: f64 = (0..12).map(|_| Forest::unit(&mut state)).sum::<f64>() - 6.0;
+                (i as f64 * 0.01).sin() + 0.05 * noise
+            })
+            .collect();
+        let mut all = raw(&values);
+        all[2_500].value = 5.0;
+        let scores = forest_scores(&all, FOREST_SEED);
+        let spike = scores.iter().find(|s| s.0 == 2_500).unwrap().1;
+        assert!(spike > 0.6, "{spike}");
+        assert!(scores.iter().all(|s| s.0 == 2_500 || s.1 < spike));
+        let mut sorted: Vec<f64> = scores.iter().map(|s| s.1).collect();
+        sorted.sort_unstable_by(f64::total_cmp);
+        assert!(sorted[sorted.len() / 2] < 0.5);
+    }
+    #[test]
+    fn isolation_forest_repeats_for_the_same_seed() {
+        let values: Vec<f64> = (0..2_000).map(|i| (i as f64 * 0.03).cos()).collect();
+        let all = raw(&values);
+        assert_eq!(forest_scores(&all, 7), forest_scores(&all, 7));
+        assert_ne!(forest_scores(&all, 7), forest_scores(&all, 8));
+    }
+    #[test]
+    fn isolation_forest_is_neutral_on_too_few_or_non_finite_inputs() {
+        let none = Forest::train(&[], FOREST_TREES, FOREST_SUBSAMPLE, FOREST_SEED);
+        assert_eq!(none.score([0.0, 0.0]), 0.5);
+        let bad = [
+            [f64::NAN, 1.0],
+            [f64::INFINITY, 2.0],
+            [1.0, f64::NEG_INFINITY],
+            [1.0, 1.0],
+        ];
+        let one = Forest::train(&bad, FOREST_TREES, FOREST_SUBSAMPLE, FOREST_SEED);
+        assert_eq!(one.score([1.0, 1.0]), 0.5);
+        let samples: Vec<[f64; 2]> = (0..50).map(|i| [i as f64, (i % 7) as f64]).collect();
+        let forest = Forest::train(&samples, FOREST_TREES, FOREST_SUBSAMPLE, FOREST_SEED);
+        for x in [
+            [f64::NAN, 0.0],
+            [0.0, f64::INFINITY],
+            [f64::NEG_INFINITY, 0.0],
+        ] {
+            assert_eq!(forest.score(x), 0.5);
+        }
+        assert_eq!(Forest::train(&samples, 0, 256, 1).score([1.0, 1.0]), 0.5);
+        assert_eq!(Forest::train(&samples, 10, 1, 1).score([1.0, 1.0]), 0.5);
+        // Identical samples cannot be split: every path is the average, score 0.5.
+        let flat = Forest::train(&[[3.0, 0.0]; 10], 10, 256, 1);
+        assert_eq!(flat.score([3.0, 0.0]), 0.5);
+        let huge = [[f64::MAX, -f64::MAX], [-f64::MAX, f64::MAX], [0.0, 0.0]];
+        assert!(
+            Forest::train(&huge, 10, 256, 1)
+                .score([0.0, 0.0])
+                .is_finite()
+        );
+    }
+    #[test]
+    fn reading_features_need_a_valid_earlier_predecessor() {
+        let mut all = raw(&[1.0, 2.0, f64::NAN, 4.0, 5.0, 7.0, 8.0]);
+        all[5].x = all[4].x + 1800.0;
+        all[6].x = all[5].x;
+        let features = reading_features(&all);
+        let index: Vec<usize> = features.iter().map(|f| f.0).collect();
+        assert_eq!(index, vec![1, 4, 5]);
+        let expected = [[2.0, 3600.0], [5.0, 3600.0], [7.0, 4.0]];
+        for (f, e) in features.iter().zip(expected) {
+            assert_eq!(f.1[0], e[0]);
+            assert!((f.1[1] - e[1]).abs() < 1e-9, "{:?}", f.1);
+        }
+        assert!(reading_features(&all[..1]).is_empty());
+        assert!(reading_features(&[]).is_empty());
+    }
+    #[test]
+    fn forest_threshold_is_the_upper_quantile() {
+        let scores = [0.7, 0.1, 1.0, 0.4, 0.9, 0.2, 0.6, 0.3, 0.8, 0.5];
+        assert_eq!(threshold(&scores, 0.2), 0.8);
+        assert_eq!(threshold(&scores, 0.0), 1.0);
+        assert_eq!(threshold(&scores, 0.05), 1.0);
+        assert_eq!(threshold(&scores, 1.0), 0.1);
+        assert_eq!(threshold(&[], FOREST_SHARE), f64::INFINITY);
+        let many: Vec<f64> = (0..1000).map(|i| i as f64 / 1000.0).collect();
+        let t = threshold(&many, FOREST_SHARE);
+        assert_eq!(many.iter().filter(|&&s| s > t).count(), 5);
+    }
+    #[test]
+    fn trained_forest_circles_a_drawn_spike_and_needs_enough_readings() {
+        let mut state = 11;
+        let values: Vec<f64> = (0..3000)
+            .map(|i| 50.0 + (i as f64 * 0.01).sin() + (Forest::unit(&mut state) - 0.5) * 0.1)
+            .collect();
+        let mut all = raw(&values);
+        all[1500].value = 58.0;
+        let (forest, limit) = train_forest(&all).unwrap();
+        let drawn: Vec<usize> = (1400..1600).collect();
+        assert!(unusual_readings(&all, &forest, limit, &drawn).contains(&1500));
+        // Index 0 has no predecessor and is never scored.
+        assert!(unusual_readings(&all, &forest, limit, &[0]).is_empty());
+        assert!(train_forest(&all[..40]).is_none());
     }
     #[test]
     fn shown_range_statistics_use_valid_readings_only() {

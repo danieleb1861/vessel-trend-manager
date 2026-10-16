@@ -42,6 +42,7 @@ is required. Other operating systems have not been tested.
 | UI language and translated texts | `src/main.rs`: `tr!`, `t`, `set_italian`; each text has an English and an Italian version |
 | Texts, colours, panels and charts | `src/gui.rs`: `App`, `CachedPlot`, `RawView`, `charts`, `flag` |
 | Analysis of the visible range | `src/gui.rs`: `Summary`, `measure`, `span`, `save_csv`, `csv_cell` |
+| Isolation Forest | `src/gui.rs`: `Forest`, `reading_features`, `threshold`, `train_forest`, `unusual_readings`, `FOREST_*` |
 | Memory reuse of loaded readings | `src/archive.rs`: `narrow`, `extend`, `Series::absorb`; `src/gui.rs`: `App::cache` |
 | Quick periods | `src/gui.rs`: `PERIODS`, `set_period` |
 | New data schema | `src/archive.rs`: `scan`, `load`, `TAG_SQL`, `sample`, `nominal` |
