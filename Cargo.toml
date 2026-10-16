@@ -1,6 +1,6 @@
 [package]
 name = "vessel-trend-manager"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Offline trend viewer for ship machinery archives (AMS SQLite exports)"
