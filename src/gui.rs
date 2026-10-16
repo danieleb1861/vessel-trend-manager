@@ -9,10 +9,10 @@ use crate::{
 };
 use chrono::{DateTime, Duration as Span};
 use eframe::egui::{self, Color32, RichText, Stroke};
-use egui_plot::{Line, Plot, Points, Polygon};
+use egui_plot::{Bar, BarChart, Line, Plot, Points, Polygon};
 use serde::{Deserialize, Serialize};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::BTreeMap,
     fs,
     io::{Read, Write},
@@ -244,6 +244,8 @@ struct CachedPlot {
     bars: Vec<Vec<[f64; 2]>>,
     /// Raw drawing of the last plot range, rebuilt only when the range or width changes.
     view: RefCell<Option<RawView>>,
+    /// Histogram of the shown range opened under the chart.
+    histogram: Cell<bool>,
 }
 impl CachedPlot {
     fn new(series: &archive::Series, mode: Mode) -> Self {
@@ -270,6 +272,7 @@ impl CachedPlot {
             segments: lines(groups, digital, mode == Mode::Daily),
             bars,
             view: RefCell::new(None),
+            histogram: Cell::new(false),
         }
     }
 }
@@ -297,7 +300,10 @@ struct Summary {
     /// Digital signals: rises and falls between consecutive valid readings; an invalid
     /// reading breaks the chain. Counts only, no durations.
     changes: Option<(usize, usize)>,
+    /// Valid readings per equal-width bin from `min` to `max` (one bin when all are equal).
+    bins: Vec<usize>,
 }
+const HISTOGRAM_BINS: usize = 24;
 impl Summary {
     fn new(raw: &[Raw], x0: f64, x1: f64, digital: bool) -> Self {
         let first = raw.partition_point(|r| r.x < x0);
@@ -310,6 +316,7 @@ impl Summary {
             mean: 0.0,
             std: 0.0,
             changes: None,
+            bins: Vec::new(),
         };
         if digital {
             let (mut rises, mut falls, mut prior) = (0, 0, None);
@@ -335,6 +342,17 @@ impl Summary {
         }
         if s.valid > 0 {
             s.std = (m2 / s.valid as f64).sqrt();
+            let bins = if s.max > s.min { HISTOGRAM_BINS } else { 1 };
+            let width = (s.max - s.min) / bins as f64;
+            s.bins = vec![0; bins];
+            for r in raw[first..end].iter().filter(|r| r.good()) {
+                let bin = if width > 0.0 {
+                    ((r.value - s.min) / width) as usize
+                } else {
+                    0
+                };
+                s.bins[bin.min(bins - 1)] += 1;
+            }
         }
         s
     }
@@ -1477,7 +1495,15 @@ impl App {
                                 ui.small(tr!("Shown: {} readings · {} valid","Visibile: {} letture · {} valide",s.count,s.valid));
                                 if s.valid>0 {ui.small(tr!("·  min {:.4}  max {:.4}  mean {:.4}  σ {:.4} {}","·  min {:.4}  max {:.4}  media {:.4}  σ {:.4} {}",s.min,s.max,s.mean,s.std,series.tag.unit));}
                                 if let Some((rises,falls))=s.changes {ui.small(tr!("·  state changes {} (↑ {} · ↓ {}) between consecutive valid readings","·  cambi di stato {} (↑ {} · ↓ {}) tra letture valide consecutive",rises+falls,rises,falls));}
+                                if !s.bins.is_empty() && ui.small_button(t("Histogram","Istogramma")).on_hover_text(t("Distribution of the valid readings shown","Distribuzione delle letture valide visibili")).clicked() {cache.histogram.set(!cache.histogram.get());}
                             });
+                            if cache.histogram.get() && !s.bins.is_empty() {
+                                let width=if s.bins.len()>1 {(s.max-s.min)/s.bins.len() as f64} else {(s.min.abs()*0.01).max(1e-6)};
+                                let left=if s.bins.len()>1 {s.min} else {s.min-width/2.0};
+                                let bars=s.bins.iter().enumerate().map(|(i,&n)|Bar::new(left+(i as f64+0.5)*width,n as f64).width(width*0.9)).collect();
+                                Plot::new(("histogram",index,self.manager.generation)).height(110.0).allow_zoom(false).allow_drag(false).allow_scroll(false).allow_boxed_zoom(false)
+                                    .show(ui,|plot| plot.bar_chart(BarChart::new(t("Valid readings","Letture valide"),bars).color(COLORS[index])));
+                            }
                         }
                     }
                     let painter=ui.painter().with_clip_rect(*response.transform.frame());
@@ -1843,6 +1869,20 @@ mod tests {
         assert!(s.changes.is_none());
         let none = Summary::new(&all, all[5].x + 1.0, all[5].x + 2.0, false);
         assert_eq!((none.count, none.valid, none.std), (0, 0, 0.0));
+        assert!(none.bins.is_empty());
+    }
+    #[test]
+    fn histogram_bins_cover_every_valid_reading_once() {
+        let values: Vec<f64> = (0..=240).map(|i| i as f64 / 10.0).collect();
+        let all = raw(&values);
+        let s = Summary::new(&all, all[0].x, all[240].x, false);
+        assert_eq!(s.bins.len(), HISTOGRAM_BINS);
+        assert_eq!(s.bins.iter().sum::<usize>(), s.valid);
+        // The maximum falls in the last bin, not past it.
+        assert_eq!(s.bins[HISTOGRAM_BINS - 1], 11);
+        let flat = raw(&[3.0, 3.0, f64::NAN]);
+        let s = Summary::new(&flat, flat[0].x, flat[2].x, false);
+        assert_eq!(s.bins, vec![2]);
     }
     #[test]
     fn digital_state_changes_are_counted_between_valid_readings_only() {
