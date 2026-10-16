@@ -37,7 +37,9 @@ visible before they become alarms.
 
 | | |
 |---|---|
-| **Fast on large histories** | Background, cancellable reads; each signal reduced to ≤ 800 buckets keeping first, last, min and max, so peaks are never smoothed away. |
+| **Every raw reading** | Daily loads keep up to 2 million raw readings in memory; zoom and pan draw the visible range from them, every reading when it fits, otherwise the real first, last, min and max per pixel column. Larger loads fall back to ≤ 800 buckets with the same rule, with a visible warning. |
+| **Fast on large histories** | Background, cancellable, parallel reads. A shorter period of loaded signals comes from memory; a wider one reads only the archives that memory lacks. |
+| **Light analysis** | For the visible range: count, valid share, min, max, mean and σ; digital state changes (counts, no durations); histogram; right-click measure of Δt, Δ and rate per hour between two readings; CSV export of the raw readings for Excel. |
 | **Honest plots** | Invalid, overridden, alarm and inhibit flags are marked; gaps and missing archives are shaded, never interpolated. |
 | **Machinery operating limits** | Min/max limits from a CSV file editable in Excel; the zone beyond each limit is shaded, with no rescaling for far limits. |
 | **Daily and weekly sources kept apart** | Raw readings and weekly min/max aggregates (drawn as range bars) are never mixed. |
@@ -85,7 +87,23 @@ DG1-LO-P;3.9;6;bar;lube oil pressure
 Limits are user-entered values, not AMS alarm thresholds. Keep real limit files local: like
 archives and preferences, they are never part of the repository or the release package.
 Synthetic limits load automatically only after explicitly opening the demo. Screenshots
-require a new `.png` filename and never overwrite an existing file.
+and CSV exports require a new filename and never overwrite an existing file; CSV exports
+are refused inside the archive folder.
+
+## Analysis of the visible range
+
+With raw daily data, a line under each chart summarises the readings currently shown and
+follows zoom and pan:
+
+- **Statistics**: readings, valid readings, min, max, mean and standard deviation (valid readings only).
+- **State changes** (digital signals): rises and falls between consecutive valid readings;
+  an invalid reading breaks the chain. Counts only: no running hours are inferred.
+- **Histogram**: distribution of the valid readings shown, in 24 equal bins.
+- **Measure**: right-click a reading (A) and a second one (B) to read Δt, Δ value and change
+  per hour. Points snap to recorded readings; nothing is interpolated.
+- **Export CSV**: the raw readings shown, with time to the nanosecond, value, unit, validity,
+  alarm and inhibit flags, archive file and row; `;` separated, decimal comma in Italian,
+  UTF-8 for Excel. Archive text is written so Excel never reads it as a formula.
 
 ## Use your own archives
 
@@ -115,15 +133,19 @@ Other layouts need an adapter in `src/archive.rs` (see [MAINTAINING.md](MAINTAIN
 ```mermaid
 flowchart LR
     A[".s3db archives<br/>days/ · weeks/"] -->|"read-only · query_only<br/>defensive SQLite"| B["scan()<br/>catalog of tags,<br/>groups and coverage"]
-    B --> C["load()<br/>≤ 4 signals · ≤ 50 M rows · ≤ 120 s<br/>parallel per archive"]
-    C -->|"≤ 800 buckets<br/>first · last · min · max"| D["CachedPlot"]
+    B --> C["load() / extend()<br/>≤ 4 signals · ≤ 50 M rows<br/>120 s without progress · 600 s in all<br/>parallel per archive"]
+    C -->|"≤ 2 M raw readings"| R["memory cache<br/>shorter periods · wider periods<br/>read only what is missing"]
+    R --> D["RawView<br/>visible range per pixel<br/>statistics · histogram"]
+    C -->|"over the cap: ≤ 800 buckets<br/>first · last · min · max"| P["CachedPlot"]
     D --> E["egui GUI<br/>EN / IT"]
+    P --> E
     W(["background worker<br/>cancellable · latest request wins"]) -.-> B
     W -.-> C
 ```
 
-SQLite never runs in the GUI loop. Every request is bounded in signals, rows and time,
-and a newer request cancels the older one.
+SQLite never runs in the GUI loop. Every request is bounded in signals, rows and time
+(it stops after 120 s without progress or 600 s in all), and a newer request cancels the
+older one. The memory cache is dropped when the archive folder is closed or reopened.
 
 The viewer is an aid for historical analysis, not a live alarm or certified safety system.
 Use closed exports on a local disk; network shares can cause Windows network traffic even
@@ -158,8 +180,8 @@ successful build, and any other file in `dist` stops the build without deleting 
 | File | Responsibility |
 |---|---|
 | `src/main.rs` | Startup, CLI, UI language |
-| `src/gui.rs` | GUI, plotting, saved views, machinery limits |
-| `src/archive.rs` | Read-only reader, reduction, background worker |
+| `src/gui.rs` | GUI, plotting, saved views, machinery limits, analysis of the visible range |
+| `src/archive.rs` | Read-only reader, raw readings and reduction, memory reuse, background worker |
 | `src/demo.rs` | Deterministic synthetic archives and limits |
 | `src/tests.rs` | Regression tests on synthetic data |
 

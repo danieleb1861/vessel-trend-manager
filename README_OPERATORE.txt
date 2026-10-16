@@ -41,24 +41,32 @@ Esempio per tutta una giornata:
 Il formato e AAAA-MM-GG HH:MM e l'istante A e escluso.
 Gli orari sono quelli dell'archivio, senza conversione di fuso.
 
-Una richiesta molto grande puo essere interrotta dal limite di tempo o
-di campioni. Ridurre parametri o periodo, oppure usare i settimanali per
-una vista d'insieme. Non viene mostrato un risultato parziale come completo.
+Una richiesta molto grande puo essere interrotta dal limite di tempo
+(120 secondi senza avanzamento oppure 10 minuti in tutto) o di campioni.
+Ridurre parametri o periodo, oppure usare i settimanali per una vista
+d'insieme. Non viene mostrato un risultato parziale come completo.
+Un periodo piu breve degli stessi parametri gia caricati arriva subito
+dalla memoria. Per un periodo piu ampio vengono letti solo gli archivi
+mancanti: si puo quindi allargare il periodo a passi successivi.
+La memoria si svuota scegliendo un'altra cartella dati o premendo Aggiorna.
 
 LEGGERE IL GRAFICO
 - Controllare data e ora dell'ultima lettura sopra ciascun grafico.
   Un dato vecchio non e una misura attuale; nessun dato non significa zero.
 - Passare il mouse sul grafico per vedere nel riquadro valore, unita,
-  timestamp e file di origine del campione conservato piu vicino.
+  timestamp, file e riga di origine della lettura piu vicina.
 - Usare la rotella per lo zoom e trascinare con il pulsante sinistro per
   spostarsi. Ripristina zoom ripristina il periodo. Con il pulsante destro
   trascinare un rettangolo per ingrandire una zona.
 - Salva schermata salva un'immagine PNG della finestra visibile. La schermata
   puo contenere nomi di impianti, letture e percorsi: conservarla localmente.
   Scegliere un nome nuovo con estensione .png: i file esistenti non vengono sovrascritti.
-- Per piu dettaglio, restringere Da/A e premere nuovamente Carica trend.
-  Il solo zoom non carica nuovi campioni. Il grafico conserva una selezione
-  di letture valide, inclusi gli estremi, per mantenere la finestra reattiva.
+- Con i giornalieri il programma tiene in memoria tutte le letture raw
+  (fino a 2 milioni per caricamento). Ingrandendo con lo zoom compaiono
+  tutte le letture; da lontano ogni colonna di pixel mostra prima, ultima,
+  minima e massima lettura reale, quindi i picchi restano visibili.
+  Oltre 2 milioni compare l'avviso Vista ridotta: per vedere ogni lettura
+  restringere Da/A o i parametri e premere nuovamente Carica trend.
 - Tacche arancio: letture non valide o forzate, escluse dalla curva.
 - Tacche rosse: flag di allarme gia registrati dal sistema AMS.
 - Tacche viola: flag di inibizione gia registrati.
@@ -66,6 +74,24 @@ LEGGERE IL GRAFICO
 - Record precedente: lettura anteriore al periodo, che non conferma lo
   stato durante il periodo. Le interruzioni della curva non provano un guasto.
 Le tacche non rappresentano la durata esatta di un allarme.
+
+ANALISI DEL TRATTO VISIBILE
+Con i giornalieri, sotto ogni grafico una riga riassume le letture visibili
+e segue zoom e spostamenti:
+- Visibile: numero di letture, letture valide, minimo, massimo, media e
+  deviazione standard (sigma), calcolati sulle sole letture valide.
+- Cambi di stato (parametri digitali): salite e discese tra letture valide
+  consecutive; una lettura non valida interrompe il conteggio. Sono solo
+  conteggi: il programma non calcola ore di moto o durate.
+- Istogramma: apre sotto il grafico la distribuzione delle letture valide.
+- Misura: clic destro su una lettura (A) e su una seconda (B) per leggere
+  intervallo di tempo, variazione e variazione all'ora. I punti sono letture
+  registrate, mai valori calcolati. La x cancella la misura.
+- Esporta CSV: salva le letture raw visibili (data e ora, valore, unita,
+  validita, allarme, inibizione, file e riga) in un file per Excel, separato
+  da punto e virgola, con la virgola decimale in italiano. Scegliere un nome
+  nuovo fuori dalla cartella degli archivi: nessun file viene sovrascritto.
+  Il file contiene letture reali: conservarlo localmente.
 
 LIMITI DEI MACCHINARI
 Limiti macchinari... importa un file CSV con una riga per parametro:

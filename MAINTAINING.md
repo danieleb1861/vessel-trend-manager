@@ -40,18 +40,25 @@ is required. Other operating systems have not been tested.
 |---|---|
 | Startup, arguments and headless check | `src/main.rs`: `options`, `request`, `run` |
 | UI language and translated texts | `src/main.rs`: `tr!`, `t`, `set_italian`; each text has an English and an Italian version |
-| Texts, colours, panels and charts | `src/gui.rs`: `App`, `CachedPlot`, `charts`, `flag` |
+| Texts, colours, panels and charts | `src/gui.rs`: `App`, `CachedPlot`, `RawView`, `charts`, `flag` |
+| Analysis of the visible range | `src/gui.rs`: `Summary`, `measure`, `span`, `save_csv`, `csv_cell` |
+| Memory reuse of loaded readings | `src/archive.rs`: `narrow`, `extend`, `Series::absorb`; `src/gui.rs`: `App::cache` |
 | Quick periods | `src/gui.rs`: `PERIODS`, `set_period` |
 | New data schema | `src/archive.rs`: `scan`, `load`, `TAG_SQL`, `sample`, `nominal` |
 | Synthetic demo archives | `src/demo.rs`: `ensure`, `sample`, `FEATURED` |
-| Load limits | `src/archive.rs`: `MAX_TAGS`, `MAX_ROWS`, `MAX_BUCKETS`, `MAX_SECONDS` |
+| Load limits | `src/archive.rs`: `MAX_TAGS`, `MAX_ROWS`, `MAX_BUCKETS`, `MAX_RAW`, `MAX_SECONDS`, `MAX_TOTAL_SECONDS`, `Deadline` |
 | Application icon | `assets/icon.png` (window), `assets/icon.ico` (executable, via `build.rs`) |
 | Packages and public files | `build.ps1`: `publicTrend`; `.gitignore` |
 
 From/To accept custom dates, with the end excluded and no fixed 30-day limit.
-Each request keeps four signals, 50 million rows and 120 seconds as limits.
+Each request keeps four signals and 50 million rows as limits, and stops after
+120 seconds without progress (rows read or an archive completed) or 600 seconds
+in all; catalog scans keep 120 seconds in all.
 Each signal has at most 800 buckets; each keeps up to four valid samples:
-first, last, minimum and maximum.
+first, last, minimum and maximum. Daily loads up to 2 million readings also keep
+every reading in compact form (`Raw`), and the chart draws the visible range from
+them per pixel column (`RawView`). A shorter period of loaded signals is served
+from memory (`narrow`); a wider one reads only what memory lacks (`extend`).
 
 `Manager` uses one thread, one pending request and one pending result.
 A new request cancels the previous one; the GUI accepts only the current
