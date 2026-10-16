@@ -9,7 +9,7 @@ use crate::{
 };
 use chrono::{DateTime, Duration as Span};
 use eframe::egui::{self, Color32, RichText, Stroke};
-use egui_plot::{Bar, BarChart, Line, Plot, Points, Polygon};
+use egui_plot::{Bar, BarChart, Line, Plot, Points, Polygon, VLine};
 use serde::{Deserialize, Serialize};
 use std::{
     cell::{Cell, RefCell},
@@ -246,6 +246,8 @@ struct CachedPlot {
     view: RefCell<Option<RawView>>,
     /// Histogram of the shown range opened under the chart.
     histogram: Cell<bool>,
+    /// Readings picked with a right click for a measure, as indices into `Series::raw`.
+    marks: Cell<[Option<usize>; 2]>,
 }
 impl CachedPlot {
     fn new(series: &archive::Series, mode: Mode) -> Self {
@@ -273,6 +275,7 @@ impl CachedPlot {
             bars,
             view: RefCell::new(None),
             histogram: Cell::new(false),
+            marks: Cell::new([None; 2]),
         }
     }
 }
@@ -286,6 +289,37 @@ struct RawView {
     /// x of groups with invalid/overridden readings, alarms and inhibits.
     flags: [Vec<f64>; 3],
     summary: Summary,
+}
+/// Archive time of a raw reading, to the nanosecond.
+fn raw_stamp(r: &Raw) -> String {
+    DateTime::from_timestamp_nanos(r.time())
+        .format("%Y-%m-%d %H:%M:%S%.f")
+        .to_string()
+}
+/// Elapsed time between two readings, from nanoseconds.
+fn span(nanos: i64) -> String {
+    let sign = if nanos < 0 { "-" } else { "" };
+    let abs = nanos.unsigned_abs();
+    if abs < 60_000_000_000 {
+        return format!("{sign}{:.3} s", abs as f64 / 1e9);
+    }
+    let seconds = abs / 1_000_000_000;
+    let (h, m, s) = (seconds / 3600, seconds % 3600 / 60, seconds % 60);
+    if h > 0 {
+        format!("{sign}{h} h {m:02} min {s:02} s")
+    } else {
+        format!("{sign}{m} min {s:02} s")
+    }
+}
+/// Change between two readings: elapsed nanoseconds, value change and change per hour.
+fn measure(a: &Raw, b: &Raw) -> (i64, f64, Option<f64>) {
+    let elapsed = b.time() - a.time();
+    let change = b.value - a.value;
+    (
+        elapsed,
+        change,
+        (elapsed != 0).then(|| change / (elapsed as f64 / 3.6e12)),
+    )
 }
 /// Readings inside the shown x range; statistics use valid readings only.
 #[derive(Debug)]
@@ -1471,6 +1505,9 @@ impl App {
                                     plot.points(Points::new(t("Raw readings","Letture raw"),v.points.iter().map(|&i|[series.raw[i].x,series.raw[i].value]).collect::<Vec<_>>()).radius(2.2_f32).color(COLORS[index]));
                                     for (j,xs) in v.flags.iter().enumerate() {flags[j]=xs.iter().map(|&x|[x,low+(high-low)*j as f64*0.04]).collect();}
                                 }
+                                for (name,mark) in ["A","B"].into_iter().zip(cache.marks.get()) {
+                                    if let Some(r)=mark.and_then(|i|series.raw.get(i)) {plot.vline(VLine::new(name,r.x).color(INK).width(1.0_f32));}
+                                }
                             } else {
                                 for line in &cache.segments {plot.line(Line::new("Trend",line.clone()).color(COLORS[index]).width(1.6_f32));}
                                 plot.points(Points::new(t("Retained readings","Letture conservate"),cache.points.iter().map(|p|[p.x(),p.value]).collect::<Vec<_>>()).radius(2.2_f32).color(COLORS[index]));
@@ -1496,7 +1533,20 @@ impl App {
                                 if s.valid>0 {ui.small(tr!("·  min {:.4}  max {:.4}  mean {:.4}  σ {:.4} {}","·  min {:.4}  max {:.4}  media {:.4}  σ {:.4} {}",s.min,s.max,s.mean,s.std,series.tag.unit));}
                                 if let Some((rises,falls))=s.changes {ui.small(tr!("·  state changes {} (↑ {} · ↓ {}) between consecutive valid readings","·  cambi di stato {} (↑ {} · ↓ {}) tra letture valide consecutive",rises+falls,rises,falls));}
                                 if !s.bins.is_empty() && ui.small_button(t("Histogram","Istogramma")).on_hover_text(t("Distribution of the valid readings shown","Distribuzione delle letture valide visibili")).clicked() {cache.histogram.set(!cache.histogram.get());}
+                                if cache.marks.get()[0].is_none() {ui.label(RichText::new(t("Right-click two readings to measure","Clic destro su due letture per misurare")).small().color(MUTED));}
                             });
+                            if let [Some(a),b]=cache.marks.get() && let Some(ra)=series.raw.get(a) {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.small(format!("A {} · {:.6} {}",raw_stamp(ra),ra.value,series.tag.unit));
+                                    if let Some(rb)=b.and_then(|b|series.raw.get(b)) {
+                                        ui.small(format!("·  B {} · {:.6} {}",raw_stamp(rb),rb.value,series.tag.unit));
+                                        let (elapsed,change,rate)=measure(ra,rb);
+                                        ui.label(RichText::new(format!("·  Δt {} · Δ {:+.4} {}",span(elapsed),change,series.tag.unit)).small().strong());
+                                        if let Some(rate)=rate {ui.label(RichText::new(format!("· {:+.4} {}/h",rate,series.tag.unit)).small().strong());}
+                                    } else {ui.small(t("·  right-click a second reading","·  clic destro su una seconda lettura"));}
+                                    if ui.small_button("×").on_hover_text(t("Clear the measure","Cancella la misura")).clicked() {cache.marks.set([None;2]);}
+                                });
+                            }
                             if cache.histogram.get() && !s.bins.is_empty() {
                                 let width=if s.bins.len()>1 {(s.max-s.min)/s.bins.len() as f64} else {(s.min.abs()*0.01).max(1e-6)};
                                 let left=if s.bins.len()>1 {s.min} else {s.min-width/2.0};
@@ -1522,6 +1572,12 @@ impl App {
                             if edge==y {painter.extend(egui::Shape::dashed_line(&[egui::pos2(frame.left(),y),egui::pos2(frame.right(),y)],Stroke::new(1.0_f32,Color32::from_rgba_unmultiplied(192,53,60,150)),6.0,4.0));}
                         }
                     }
+                    // A right click picks the nearest drawn reading: first A, then B, then A again.
+                    if trends.raw && response.response.secondary_clicked()
+                        && let Some(pointer)=response.inner
+                        && let Some(i)=cache.view.borrow().as_ref().and_then(|v|v.points.iter().copied().min_by(|&a,&b|(series.raw[a].x-pointer.x).abs().total_cmp(&(series.raw[b].x-pointer.x).abs()))) {
+                            cache.marks.set(match cache.marks.get() {[Some(a),None]=>[Some(a),Some(i)],_=>[Some(i),None]});
+                        }
                     if trends.raw && response.response.hovered()
                         && let Some(pointer)=response.inner {
                             let view=cache.view.borrow();
@@ -1870,6 +1926,20 @@ mod tests {
         let none = Summary::new(&all, all[5].x + 1.0, all[5].x + 2.0, false);
         assert_eq!((none.count, none.valid, none.std), (0, 0, 0.0));
         assert!(none.bins.is_empty());
+    }
+    #[test]
+    fn measure_reports_elapsed_time_change_and_rate() {
+        let mut pair = raw(&[10.0, 13.0]);
+        pair[1].x = pair[0].x + 5400.0;
+        pair[1].nanos = 250;
+        let (elapsed, change, rate) = measure(&pair[0], &pair[1]);
+        assert_eq!((elapsed, change), (5_400_000_000_250, 3.0));
+        assert!((rate.unwrap() - 2.0).abs() < 1e-9);
+        assert_eq!(span(elapsed), "1 h 30 min 00 s");
+        assert_eq!(span(-1_500_000_000), "-1.500 s");
+        assert_eq!(span(61_000_000_000), "1 min 01 s");
+        assert_eq!(measure(&pair[0], &pair[0]).2, None);
+        assert_eq!(raw_stamp(&pair[1]), "2023-11-14 23:43:20.000000250");
     }
     #[test]
     fn histogram_bins_cover_every_valid_reading_once() {
