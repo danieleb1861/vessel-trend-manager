@@ -124,6 +124,101 @@ fn save_screenshot(path: &Path, bytes: &[u8], width: u32, height: u32) -> Result
         .write_image(bytes, width, height, image::ExtendedColorType::Rgba8)
         .map_err(|e| e.to_string())
 }
+/// A CSV cell from archive text: quoted when needed, and never read by Excel as a formula.
+fn csv_cell(text: &str) -> String {
+    let text = if text.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        format!("'{text}")
+    } else {
+        text.to_string()
+    };
+    if text.contains([';', '"', '\n', '\r']) {
+        format!("\"{}\"", text.replace('"', "\"\""))
+    } else {
+        text
+    }
+}
+/// Writes the raw readings of one signal inside `[x0, x1]` for Excel: `;` separated, decimal
+/// comma when `comma`, UTF-8 with BOM. Never overwrites a file or writes in the archive folder.
+fn save_csv(
+    path: &Path,
+    archives: &Path,
+    series: &archive::Series,
+    sources: &[PathBuf],
+    (x0, x1): (f64, f64),
+    comma: bool,
+) -> Result<usize, String> {
+    if !path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("csv"))
+    {
+        return Err(t("Choose a new .csv file.", "Scegliere un nuovo file .csv.").into());
+    }
+    if let (Some(parent), Ok(folder)) = (
+        path.parent().and_then(|p| p.canonicalize().ok()),
+        archives.canonicalize(),
+    ) && parent.starts_with(folder)
+    {
+        return Err(t(
+            "Choose a folder outside the archives.",
+            "Scegliere una cartella fuori dagli archivi.",
+        )
+        .into());
+    }
+    // CREATE_NEW refuses existing files, including links: never overwrite anything.
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| {
+            tr!(
+                "Choose a new CSV filename: {}",
+                "Scegliere un nuovo nome CSV: {}",
+                e
+            )
+        })?;
+    let first = series.raw.partition_point(|r| r.x < x0);
+    let end = series.raw.partition_point(|r| r.x <= x1).max(first);
+    let number = |v: f64| match (v.is_finite(), comma) {
+        (false, _) => String::new(),
+        (true, true) => v.to_string().replace('.', ","),
+        (true, false) => v.to_string(),
+    };
+    let unit = csv_cell(&series.tag.unit);
+    let mut out = std::io::BufWriter::new(file);
+    (|| -> std::io::Result<()> {
+        out.write_all("\u{feff}".as_bytes())?;
+        writeln!(
+            out,
+            "{}",
+            t(
+                "time;value;unit;valid;alarm;inhibit;file;row",
+                "data_ora;valore;unita;valida;allarme;inibizione;file;riga"
+            )
+        )?;
+        for r in &series.raw[first..end] {
+            let file = sources
+                .get(r.source as usize)
+                .and_then(|p| p.file_name())
+                .unwrap_or_default()
+                .to_string_lossy();
+            writeln!(
+                out,
+                "{};{};{};{};{};{};{};{}",
+                raw_stamp(r),
+                number(r.value),
+                unit,
+                u8::from(r.good()),
+                r.flags >> 1 & 1,
+                r.flags >> 2 & 1,
+                csv_cell(&file),
+                r.row_id
+            )?;
+        }
+        out.flush()
+    })()
+    .map_err(|e| e.to_string())?;
+    Ok(end - first)
+}
 fn parse_limits(text: &str) -> Result<BTreeMap<String, Limit>, String> {
     let mut limits = BTreeMap::new();
     for (number, line) in text.trim_start_matches('\u{feff}').lines().enumerate() {
@@ -1453,6 +1548,7 @@ impl App {
             175.0
         };
         let reset = self.reset;
+        let mut export = None;
         egui::ScrollArea::vertical().id_salt("charts").show(ui,|ui| {
             for (index,(series,cache)) in trends.series.iter().zip(&self.plots).enumerate() {
                 egui::Frame::new().fill(Color32::WHITE).corner_radius(8).inner_margin(12).show(ui,|ui| {
@@ -1533,6 +1629,7 @@ impl App {
                                 if s.valid>0 {ui.small(tr!("·  min {:.4}  max {:.4}  mean {:.4}  σ {:.4} {}","·  min {:.4}  max {:.4}  media {:.4}  σ {:.4} {}",s.min,s.max,s.mean,s.std,series.tag.unit));}
                                 if let Some((rises,falls))=s.changes {ui.small(tr!("·  state changes {} (↑ {} · ↓ {}) between consecutive valid readings","·  cambi di stato {} (↑ {} · ↓ {}) tra letture valide consecutive",rises+falls,rises,falls));}
                                 if !s.bins.is_empty() && ui.small_button(t("Histogram","Istogramma")).on_hover_text(t("Distribution of the valid readings shown","Distribuzione delle letture valide visibili")).clicked() {cache.histogram.set(!cache.histogram.get());}
+                                if ui.small_button(t("Export CSV","Esporta CSV")).on_hover_text(t("Save the raw readings shown, for Excel","Salva le letture raw visibili, per Excel")).clicked() {export=Some(index);}
                                 if cache.marks.get()[0].is_none() {ui.label(RichText::new(t("Right-click two readings to measure","Clic destro su due letture per misurare")).small().color(MUTED));}
                             });
                             if let [Some(a),b]=cache.marks.get() && let Some(ra)=series.raw.get(a) {
@@ -1609,6 +1706,32 @@ impl App {
             ui.label(RichText::new(if self.limits.is_empty() {t("Markers do not show the exact duration of states. No machinery operating limits imported (Machinery limits...).","I marcatori non indicano la durata esatta degli stati. Nessun limite dei macchinari importato (Limiti macchinari...).")} else {t("Markers do not show the exact duration of states. Red shading beyond the dashed lines: outside the machinery operating limits.","I marcatori non indicano la durata esatta degli stati. Ombreggiatura rossa oltre le linee tratteggiate: fuori dai limiti dei macchinari.")}).size(11.0).color(MUTED));
         });
         self.reset = false;
+        if let Some(index) = export
+            && let (Some(series), Some(cache)) = (trends.series.get(index), self.plots.get(index))
+            && let Some((x0, x1, _)) = cache.view.borrow().as_ref().map(|v| v.key)
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("CSV", &["csv"])
+                .set_file_name("trend.csv")
+                .save_file()
+        {
+            match save_csv(
+                &path,
+                Path::new(&self.folder),
+                series,
+                &trends.sources,
+                (x0, x1),
+                crate::italian(),
+            ) {
+                Ok(n) => {
+                    self.status = tr!(
+                        "{} readings exported to CSV",
+                        "{} letture esportate in CSV",
+                        n
+                    )
+                }
+                Err(e) => self.error = Some(e),
+            }
+        }
     }
 }
 impl eframe::App for App {
@@ -1926,6 +2049,49 @@ mod tests {
         let none = Summary::new(&all, all[5].x + 1.0, all[5].x + 2.0, false);
         assert_eq!((none.count, none.valid, none.std), (0, 0, 0.0));
         assert!(none.bins.is_empty());
+    }
+    #[test]
+    fn csv_export_writes_shown_raw_readings_without_overwriting() {
+        let folder = std::env::temp_dir().join(format!(
+            "vtm_csv_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let archives = folder.join("archives");
+        fs::create_dir_all(&archives).unwrap();
+        let mut s = series("Analog", 10, 1, 0);
+        s.tag.unit = "=bar".into();
+        s.raw = raw(&[1.5, f64::NAN, 2.25]);
+        s.raw[1].flags |= 2;
+        let sources = vec![archives.join("Day_2025-01-01.s3db")];
+        let range = (s.raw[0].x, s.raw[1].x);
+        let path = folder.join("out.csv");
+        assert_eq!(save_csv(&path, &archives, &s, &sources, range, true), Ok(2));
+        let text = fs::read_to_string(&path).unwrap();
+        let lines: Vec<_> = text.trim_start_matches('\u{feff}').lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[1].starts_with("2023-11-14 22:13:20;1,5;'=bar;1;0;0;Day_2025-01-01.s3db;1"));
+        assert!(lines[2].ends_with(";;'=bar;0;1;0;Day_2025-01-01.s3db;2"));
+        // No overwrite, no writes among the archives, CSV extension only.
+        assert!(save_csv(&path, &archives, &s, &sources, range, true).is_err());
+        assert!(
+            save_csv(
+                &archives.join("x.csv"),
+                &archives,
+                &s,
+                &sources,
+                range,
+                true
+            )
+            .is_err()
+        );
+        assert!(save_csv(&folder.join("x.txt"), &archives, &s, &sources, range, true).is_err());
+        assert!(!archives.join("x.csv").exists());
+        assert_eq!(csv_cell("a;\"b\""), "\"a;\"\"b\"\"\"");
+        fs::remove_dir_all(folder).unwrap();
     }
     #[test]
     fn measure_reports_elapsed_time_change_and_rate() {
