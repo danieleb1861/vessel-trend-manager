@@ -294,9 +294,12 @@ struct Summary {
     mean: f64,
     /// Population standard deviation.
     std: f64,
+    /// Digital signals: rises and falls between consecutive valid readings; an invalid
+    /// reading breaks the chain. Counts only, no durations.
+    changes: Option<(usize, usize)>,
 }
 impl Summary {
-    fn new(raw: &[Raw], x0: f64, x1: f64) -> Self {
+    fn new(raw: &[Raw], x0: f64, x1: f64, digital: bool) -> Self {
         let first = raw.partition_point(|r| r.x < x0);
         let end = raw.partition_point(|r| r.x <= x1).max(first);
         let mut s = Self {
@@ -306,7 +309,20 @@ impl Summary {
             max: f64::NEG_INFINITY,
             mean: 0.0,
             std: 0.0,
+            changes: None,
         };
+        if digital {
+            let (mut rises, mut falls, mut prior) = (0, 0, None);
+            for r in &raw[first..end] {
+                let value = r.good().then_some(r.value);
+                if let (Some(a), Some(b)) = (prior, value) {
+                    rises += usize::from(b > a);
+                    falls += usize::from(b < a);
+                }
+                prior = value;
+            }
+            s.changes = Some((rises, falls));
+        }
         // Welford's update keeps the variance accurate over millions of readings.
         let mut m2 = 0.0;
         for r in raw[first..end].iter().filter(|r| r.good()) {
@@ -331,7 +347,7 @@ impl RawView {
             points: Vec::new(),
             segments: Vec::new(),
             flags: Default::default(),
-            summary: Summary::new(raw, x0, x1),
+            summary: Summary::new(raw, x0, x1, digital),
         };
         // Half a view of margin on each side hides the one-frame bounds lag while panning.
         let (lo, hi) = (x0 - (x1 - x0) / 2.0, x1 + (x1 - x0) / 2.0);
@@ -1460,6 +1476,7 @@ impl App {
                             ui.horizontal_wrapped(|ui| {
                                 ui.small(tr!("Shown: {} readings · {} valid","Visibile: {} letture · {} valide",s.count,s.valid));
                                 if s.valid>0 {ui.small(tr!("·  min {:.4}  max {:.4}  mean {:.4}  σ {:.4} {}","·  min {:.4}  max {:.4}  media {:.4}  σ {:.4} {}",s.min,s.max,s.mean,s.std,series.tag.unit));}
+                                if let Some((rises,falls))=s.changes {ui.small(tr!("·  state changes {} (↑ {} · ↓ {}) between consecutive valid readings","·  cambi di stato {} (↑ {} · ↓ {}) tra letture valide consecutive",rises+falls,rises,falls));}
                             });
                         }
                     }
@@ -1819,12 +1836,22 @@ mod tests {
     #[test]
     fn shown_range_statistics_use_valid_readings_only() {
         let all = raw(&[2.0, 4.0, f64::NAN, 4.0, 5.0, 100.0]);
-        let s = Summary::new(&all, all[0].x, all[4].x);
+        let s = Summary::new(&all, all[0].x, all[4].x, false);
         assert_eq!((s.count, s.valid), (5, 4));
         assert_eq!((s.min, s.max, s.mean), (2.0, 5.0, 3.75));
         assert!((s.std - 1.0897247358851685).abs() < 1e-12);
-        let none = Summary::new(&all, all[5].x + 1.0, all[5].x + 2.0);
+        assert!(s.changes.is_none());
+        let none = Summary::new(&all, all[5].x + 1.0, all[5].x + 2.0, false);
         assert_eq!((none.count, none.valid, none.std), (0, 0, 0.0));
+    }
+    #[test]
+    fn digital_state_changes_are_counted_between_valid_readings_only() {
+        // 0→1 rise, 1→0 fall, then a change across an invalid reading is not counted.
+        let states = raw(&[0.0, 1.0, 1.0, 0.0, f64::NAN, 1.0, 1.0]);
+        let s = Summary::new(&states, states[0].x, states[6].x, true);
+        assert_eq!(s.changes, Some((1, 1)));
+        let s = Summary::new(&states, states[1].x, states[3].x, true);
+        assert_eq!(s.changes, Some((0, 1)));
     }
     #[test]
     fn reduced_digital_plot_does_not_invent_state_duration() {
