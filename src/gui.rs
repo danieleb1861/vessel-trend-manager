@@ -282,16 +282,57 @@ struct RawView {
     segments: Vec<Vec<[f64; 2]>>,
     /// x of groups with invalid/overridden readings, alarms and inhibits.
     flags: [Vec<f64>; 3],
+    summary: Summary,
+}
+/// Readings inside the shown x range; statistics use valid readings only.
+#[derive(Debug)]
+struct Summary {
+    count: usize,
+    valid: usize,
+    min: f64,
+    max: f64,
+    mean: f64,
+    /// Population standard deviation.
+    std: f64,
+}
+impl Summary {
+    fn new(raw: &[Raw], x0: f64, x1: f64) -> Self {
+        let first = raw.partition_point(|r| r.x < x0);
+        let end = raw.partition_point(|r| r.x <= x1).max(first);
+        let mut s = Self {
+            count: end - first,
+            valid: 0,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+            mean: 0.0,
+            std: 0.0,
+        };
+        // Welford's update keeps the variance accurate over millions of readings.
+        let mut m2 = 0.0;
+        for r in raw[first..end].iter().filter(|r| r.good()) {
+            s.valid += 1;
+            s.min = s.min.min(r.value);
+            s.max = s.max.max(r.value);
+            let delta = r.value - s.mean;
+            s.mean += delta / s.valid as f64;
+            m2 += delta * (r.value - s.mean);
+        }
+        if s.valid > 0 {
+            s.std = (m2 / s.valid as f64).sqrt();
+        }
+        s
+    }
 }
 impl RawView {
     fn new(raw: &[Raw], key: (f64, f64, usize), digital: bool) -> Self {
+        let (x0, x1, width) = key;
         let mut view = Self {
             key,
             points: Vec::new(),
             segments: Vec::new(),
             flags: Default::default(),
+            summary: Summary::new(raw, x0, x1),
         };
-        let (x0, x1, width) = key;
         // Half a view of margin on each side hides the one-frame bounds lag while panning.
         let (lo, hi) = (x0 - (x1 - x0) / 2.0, x1 + (x1 - x0) / 2.0);
         if !(lo.is_finite() && hi.is_finite() && hi > lo) {
@@ -1414,6 +1455,13 @@ impl App {
                         let b=response.transform.bounds();
                         let key=(b.min()[0],b.max()[0],response.transform.frame().width().max(1.0) as usize);
                         if cache.view.borrow().as_ref().is_none_or(|v|v.key!=key) {ui.ctx().request_repaint();}
+                        if let Some(v)=cache.view.borrow().as_ref() {
+                            let s=&v.summary;
+                            ui.horizontal_wrapped(|ui| {
+                                ui.small(tr!("Shown: {} readings · {} valid","Visibile: {} letture · {} valide",s.count,s.valid));
+                                if s.valid>0 {ui.small(tr!("·  min {:.4}  max {:.4}  mean {:.4}  σ {:.4} {}","·  min {:.4}  max {:.4}  media {:.4}  σ {:.4} {}",s.min,s.max,s.mean,s.std,series.tag.unit));}
+                            });
+                        }
                     }
                     let painter=ui.painter().with_clip_rect(*response.transform.frame());
                     for bar in &cache.bars {
@@ -1767,6 +1815,16 @@ mod tests {
         // Zoomed to 100 readings on a 200 px plot: every raw reading in range is drawn.
         let view = RawView::new(&all, (all[50_000].x, all[50_099].x, 200), false);
         assert!((50_000..50_100).all(|i| view.points.contains(&i)));
+    }
+    #[test]
+    fn shown_range_statistics_use_valid_readings_only() {
+        let all = raw(&[2.0, 4.0, f64::NAN, 4.0, 5.0, 100.0]);
+        let s = Summary::new(&all, all[0].x, all[4].x);
+        assert_eq!((s.count, s.valid), (5, 4));
+        assert_eq!((s.min, s.max, s.mean), (2.0, 5.0, 3.75));
+        assert!((s.std - 1.0897247358851685).abs() < 1e-12);
+        let none = Summary::new(&all, all[5].x + 1.0, all[5].x + 2.0);
+        assert_eq!((none.count, none.valid, none.std), (0, 0, 0.0));
     }
     #[test]
     fn reduced_digital_plot_does_not_invent_state_duration() {
