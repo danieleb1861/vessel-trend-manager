@@ -43,6 +43,7 @@ is required. Other operating systems have not been tested.
 | Texts, colours, panels and charts | `src/gui.rs`: `App`, `CachedPlot`, `RawView`, `charts`, `flag` |
 | Analysis of the visible range | `src/gui.rs`: `Summary`, `measure`, `span`, `save_csv`, `csv_cell` |
 | Isolation Forest | `src/gui.rs`: `Forest`, `reading_features`, `threshold`, `train_forest`, `unusual_readings`, `FOREST_*` |
+| Jev-style pattern classifier | `src/gui.rs`: `PATTERNS`, `pattern_features`, `synthetic_patterns`, `PatternModel`, `classify_pattern`; trained only on synthetic windows |
 | Memory reuse of loaded readings | `src/archive.rs`: `narrow`, `extend`, `Series::absorb`; `src/gui.rs`: `App::cache` |
 | Quick periods | `src/gui.rs`: `PERIODS`, `set_period` |
 | New data schema | `src/archive.rs`: `scan`, `load`, `TAG_SQL`, `sample`, `nominal` |

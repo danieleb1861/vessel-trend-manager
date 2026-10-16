@@ -405,6 +405,8 @@ struct RawView {
     /// x of groups with invalid/overridden readings, alarms and inhibits.
     flags: [Vec<f64>; 3],
     summary: Summary,
+    /// Analog signals: probability of each `PATTERNS` label for the drawn readings shown.
+    pattern: Option<[f64; 5]>,
 }
 /// Archive time of a raw reading, to the nanosecond.
 fn raw_stamp(r: &Raw) -> String {
@@ -516,6 +518,7 @@ impl RawView {
             segments: Vec::new(),
             flags: Default::default(),
             summary: Summary::new(raw, x0, x1, digital),
+            pattern: None,
         };
         // Half a view of margin on each side hides the one-frame bounds lag while panning.
         let (lo, hi) = (x0 - (x1 - x0) / 2.0, x1 + (x1 - x0) / 2.0);
@@ -571,8 +574,414 @@ impl RawView {
             view.points.extend(kept);
         }
         view.segments = lines(groups, digital, true);
+        if !digital {
+            // Drawn readings keep every reading when zoomed in and each column's extremes otherwise.
+            let (times, values): (Vec<f64>, Vec<f64>) = view
+                .points
+                .iter()
+                .map(|&i| &raw[i])
+                .filter(|r| r.x >= x0 && r.x <= x1)
+                .map(|r| (r.x, r.value))
+                .unzip();
+            view.pattern = classify_pattern(&times, &values);
+        }
         view
     }
+}
+/// Closed (English, Italian) label set answering "how does this signal behave
+/// over the shown range?".
+const PATTERNS: [(&str, &str); 5] = [
+    ("stable", "stabile"),
+    ("drift", "deriva"),
+    ("step", "gradino"),
+    ("spikes", "picchi"),
+    ("stuck", "bloccato"),
+];
+const PATTERN_FEATURES: usize = 9;
+/// Upper median; reorders `values`.
+fn pattern_median(values: &mut [f64]) -> f64 {
+    let mid = values.len() / 2;
+    *values.select_nth_unstable_by(mid, f64::total_cmp).1
+}
+/// Bounded, log-compressed `num / den`; zero when both are zero.
+fn pattern_ratio(num: f64, den: f64) -> f64 {
+    if num <= 0.0 {
+        0.0
+    } else if den <= 0.0 {
+        1e6f64.ln_1p()
+    } else {
+        (num / den).min(1e6).ln_1p()
+    }
+}
+/// Bounded, scale-, offset- and time-invariant features of the valid readings
+/// of the shown range, in time order (times in seconds). O(n) apart from fixed
+/// subsamples; None below 20 readings or with non-finite input.
+fn pattern_features(times: &[f64], values: &[f64]) -> Option<[f64; PATTERN_FEATURES]> {
+    let n = values.len();
+    if n < 20 || times.len() != n {
+        return None;
+    }
+    let mut mean = 0.0;
+    for (t, v) in times.iter().zip(values) {
+        if !t.is_finite() || !v.is_finite() {
+            return None;
+        }
+        mean += v / n as f64;
+    }
+    let duration = times[n - 1] - times[0];
+    if duration <= 0.0 {
+        return None;
+    }
+    // Normalized time, centered values and their sums in one pass.
+    let (mut u, mut c) = (Vec::with_capacity(n), Vec::with_capacity(n));
+    let (mut sum, mut sq) = (Vec::with_capacity(n + 1), Vec::with_capacity(n + 1));
+    let (mut um, mut sst) = (0.0, 0.0);
+    sum.push(0.0);
+    sq.push(0.0);
+    for (t, v) in times.iter().zip(values) {
+        let (x, v) = ((t - times[0]) / duration, v - mean);
+        u.push(x);
+        c.push(v);
+        um += x / n as f64;
+        sst += v * v;
+        sum.push(sum[sum.len() - 1] + v);
+        sq.push(sst);
+    }
+    if !sst.is_finite() {
+        return None;
+    }
+    // Theil-Sen slope on at most 12 evenly spaced readings keeps the cost fixed.
+    let m = n.min(12);
+    let picks: Vec<usize> = (0..m).map(|k| k * (n - 1) / (m - 1)).collect();
+    let mut slopes = Vec::with_capacity(m * (m - 1) / 2);
+    for (a, &i) in picks.iter().enumerate() {
+        for &j in &picks[a + 1..] {
+            if u[j] > u[i] {
+                slopes.push((c[j] - c[i]) / (u[j] - u[i]));
+            }
+        }
+    }
+    let slope = if slopes.is_empty() {
+        0.0
+    } else {
+        pattern_median(&mut slopes)
+    };
+    // Residuals around the Theil-Sen line (reused in place) and the line fit sums.
+    let (mut suu, mut sux) = (0.0, 0.0);
+    let mut dev: Vec<f64> = Vec::with_capacity(n);
+    for (x, v) in u.iter().zip(&c) {
+        dev.push(v - slope * x);
+        suu += (x - um) * (x - um);
+        sux += (x - um) * v;
+    }
+    // Robust level and spread from at most 48 evenly spaced residuals.
+    let k = n.min(48);
+    let mut probe: Vec<f64> = (0..k).map(|i| dev[i * (n - 1) / (k - 1)]).collect();
+    let level = pattern_median(&mut probe);
+    let (mut peak, mut energy) = (0.0f64, 0.0);
+    for r in dev.iter_mut() {
+        *r = (*r - level).abs();
+        peak = peak.max(*r);
+        energy += *r * *r;
+    }
+    for (i, p) in probe.iter_mut().enumerate() {
+        *p = dev[i * (n - 1) / (k - 1)];
+    }
+    let mut scale = 1.4826 * pattern_median(&mut probe);
+    if scale <= 0.0 {
+        scale = (energy / n as f64).sqrt();
+    }
+    let outliers = if scale > 0.0 {
+        dev.iter().filter(|r| **r > 5.0 * scale).count() as f64 / n as f64
+    } else {
+        0.0
+    };
+    // Least-squares line on normalized time for R^2 and the residual energy.
+    let ls = if suu > 0.0 { sux / suu } else { 0.0 };
+    let sse_line = (sst - ls * sux).max(0.0);
+    // Best two-segment split with prefix sums, both segments >= 10% of readings.
+    let edge = (n / 10).max(2);
+    let (mut sse_two, mut jump) = (f64::INFINITY, 0.0);
+    for k in edge..=n - edge {
+        let (l, r) = (k as f64, (n - k) as f64);
+        let (sl, sr) = (sum[k], sum[n] - sum[k]);
+        let sse = (sq[k] - sl * sl / l).max(0.0) + (sq[n] - sq[k] - sr * sr / r).max(0.0);
+        if sse < sse_two {
+            (sse_two, jump) = (sse, (sl / l - sr / r).abs());
+        }
+    }
+    let tiny = 1e-12 * sst + f64::MIN_POSITIVE;
+    // Differences: mean in closed form, then spread, lag-1 product and repeats.
+    let dm = (values[n - 1] - values[0]) / (n - 1) as f64;
+    let (mut sdd, mut lag, mut rough, mut flat, mut prior) = (0.0, 0.0, 0.0, 0usize, 0.0);
+    for (i, w) in values.windows(2).enumerate() {
+        let d = w[1] - w[0];
+        let e = d - dm;
+        sdd += e * e;
+        if i > 0 {
+            lag += prior * e;
+        }
+        prior = e;
+        rough += d * d / (n - 1) as f64;
+        flat += usize::from(d == 0.0);
+    }
+    Some([
+        // Trend: Theil-Sen change over the range against the robust residual spread.
+        pattern_ratio(slope.abs(), scale),
+        // Linearity: R^2 of the least-squares line.
+        if sst > 0.0 {
+            (1.0 - sse_line / sst).clamp(0.0, 1.0)
+        } else {
+            0.0
+        },
+        // Step: mean jump at the best split against the pooled segment spread.
+        pattern_ratio(jump, (sse_two / (n - 2) as f64).sqrt()),
+        // Step versus line: log ratio of line and two-segment residual energy.
+        if sst > 0.0 {
+            ((sse_line + tiny) / (sse_two + tiny))
+                .ln()
+                .clamp(-10.0, 10.0)
+        } else {
+            0.0
+        },
+        // Spikes: largest robust residual z-score.
+        pattern_ratio(peak, scale),
+        // Share of readings with robust |z| above 5.
+        outliers,
+        // Flatness: share of consecutive equal values.
+        flat as f64 / (n - 1) as f64,
+        // Roughness: RMS step-to-step change against the overall spread, at most 2.
+        if sst > 0.0 {
+            (rough / (sst / n as f64)).sqrt().min(2.0)
+        } else {
+            0.0
+        },
+        // Lag-1 autocorrelation of differences: -0.5 for white noise.
+        if sdd > 0.0 {
+            (lag / sdd).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        },
+    ])
+}
+/// SplitMix64: tiny deterministic generator for the synthetic training windows.
+struct PatternRng(u64);
+impl PatternRng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn unit(&mut self) -> f64 {
+        (self.next() >> 11) as f64 / (1u64 << 53) as f64
+    }
+    fn range(&mut self, low: f64, high: f64) -> f64 {
+        low + (high - low) * self.unit()
+    }
+    fn index(&mut self, low: usize, high: usize) -> usize {
+        low + (self.next() % (high - low) as u64) as usize
+    }
+    /// `n` standard normal values, two per Box-Muller draw.
+    fn normals(&mut self, n: usize) -> Vec<f64> {
+        let mut out = Vec::with_capacity(n + 1);
+        while out.len() < n {
+            let r = (-2.0 * (1.0 - self.unit()).ln()).sqrt();
+            let (sin, cos) = (std::f64::consts::TAU * self.unit()).sin_cos();
+            out.push(r * cos);
+            out.push(r * sin);
+        }
+        out.truncate(n);
+        out
+    }
+}
+/// Synthetic windows of every label with their features; labels index `PATTERNS`.
+fn synthetic_patterns(seed: u64, per_class: usize) -> Vec<([f64; PATTERN_FEATURES], usize)> {
+    let mut rng = PatternRng(seed);
+    let mut data = Vec::with_capacity(per_class * PATTERNS.len());
+    for _ in 0..per_class {
+        for label in 0..PATTERNS.len() {
+            let n = 10f64.powf(rng.range(1.6, 2.6)).round() as usize;
+            let step = 10f64.powf(rng.range(0.0, 3.5));
+            let start = rng.range(0.0, 2e9);
+            let jitter = rng.range(0.0, 0.3);
+            let mut times = Vec::with_capacity(n);
+            for i in 0..n {
+                times.push(start + step * (i as f64 + jitter * rng.unit()));
+            }
+            let offset = rng.range(-1.0, 1.0) * 10f64.powf(rng.range(0.0, 4.0));
+            let sigma = 10f64.powf(rng.range(-2.0, 2.0));
+            // Background: noise, a slow small oscillation and a negligible slope.
+            let wave = sigma * rng.range(0.0, 0.8) * f64::from(rng.unit() < 0.5);
+            let period = rng.range(0.4, 3.0);
+            let phase = rng.range(0.0, std::f64::consts::TAU);
+            let creep = sigma * rng.range(-0.4, 0.4);
+            let mut values = rng.normals(n);
+            for (i, v) in values.iter_mut().enumerate() {
+                let x = i as f64 / (n - 1) as f64;
+                *v = offset + sigma * *v + creep * x;
+                if wave > 0.0 {
+                    *v += wave * (std::f64::consts::TAU * x / period + phase).sin();
+                }
+            }
+            let sign = if rng.unit() < 0.5 { -1.0 } else { 1.0 };
+            let size = sign * sigma * 10f64.powf(rng.range(0.6, 1.8));
+            match label {
+                1 => {
+                    let power = if rng.unit() < 0.5 {
+                        1.0
+                    } else {
+                        rng.range(0.5, 2.0)
+                    };
+                    for (i, v) in values.iter_mut().enumerate() {
+                        *v += size * (i as f64 / (n - 1) as f64).powf(power);
+                    }
+                }
+                2 => {
+                    let at = rng.index(n * 3 / 20, n * 17 / 20);
+                    values[at..].iter_mut().for_each(|v| *v += size);
+                }
+                3 => {
+                    for _ in 0..rng.index(1, 6) {
+                        let at = rng.index(0, n);
+                        let sign = if rng.unit() < 0.5 { -1.0 } else { 1.0 };
+                        values[at] += sign * sigma * rng.range(8.0, 40.0);
+                    }
+                }
+                4 => {
+                    values.iter_mut().for_each(|v| *v = offset);
+                    // Rare tiny changes: single-reading blips or small held offsets.
+                    for _ in 0..rng.index(0, 4) {
+                        let at = rng.index(1, n);
+                        let tick = sigma * rng.range(0.001, 0.05);
+                        let end = if rng.unit() < 0.5 { at + 1 } else { n };
+                        values[at..end].iter_mut().for_each(|v| *v += tick);
+                    }
+                }
+                _ => {}
+            }
+            // Some sources report quantized values.
+            if label != 4 && rng.unit() < 0.3 {
+                let q = sigma * rng.range(0.05, 0.5);
+                values.iter_mut().for_each(|v| *v = (*v / q).round() * q);
+            }
+            if let Some(features) = pattern_features(&times, &values) {
+                data.push((features, label));
+            }
+        }
+    }
+    data
+}
+/// Multinomial logistic regression on standardized features. Exploratory
+/// indication only: trained only on synthetic data, not calibrated on real
+/// vessels, and not an alarm.
+struct PatternModel {
+    mean: [f64; PATTERN_FEATURES],
+    std: [f64; PATTERN_FEATURES],
+    weights: [[f64; PATTERN_FEATURES + 1]; 5],
+}
+impl PatternModel {
+    /// Deterministic full-batch gradient descent with a small L2 penalty.
+    fn train(data: &[([f64; PATTERN_FEATURES], usize)]) -> Self {
+        let count = data.len().max(1) as f64;
+        let mut mean = [0.0; PATTERN_FEATURES];
+        let mut std = [0.0; PATTERN_FEATURES];
+        for (x, _) in data {
+            for j in 0..PATTERN_FEATURES {
+                mean[j] += x[j] / count;
+            }
+        }
+        for (x, _) in data {
+            for j in 0..PATTERN_FEATURES {
+                std[j] += (x[j] - mean[j]).powi(2) / count;
+            }
+        }
+        std.iter_mut()
+            .for_each(|s| *s = if *s > 0.0 { s.sqrt() } else { 1.0 });
+        let mut model = Self {
+            mean,
+            std,
+            weights: [[0.0; PATTERN_FEATURES + 1]; 5],
+        };
+        let rows: Vec<([f64; PATTERN_FEATURES], usize)> =
+            data.iter().map(|(x, y)| (model.standard(x), *y)).collect();
+        // Start from the nearest-centroid rule so few descent steps are needed.
+        let mut members = [0.0f64; 5];
+        for (x, y) in &rows {
+            members[*y] += 1.0;
+            for (w, v) in model.weights[*y].iter_mut().zip(x) {
+                *w += v;
+            }
+        }
+        for (w, m) in model.weights.iter_mut().zip(members) {
+            let mut norm = 0.0;
+            for v in w.iter_mut().take(PATTERN_FEATURES) {
+                *v /= m.max(1.0);
+                norm += *v * *v;
+            }
+            w[PATTERN_FEATURES] = -0.5 * norm;
+        }
+        let mut velocity = [[0.0; PATTERN_FEATURES + 1]; 5];
+        for _ in 0..12 {
+            let mut grad = [[0.0; PATTERN_FEATURES + 1]; 5];
+            for (x, y) in &rows {
+                let p = model.softmax(x);
+                for c in 0..5 {
+                    let e = p[c] - f64::from(c == *y);
+                    for j in 0..PATTERN_FEATURES {
+                        grad[c][j] += e * x[j];
+                    }
+                    grad[c][PATTERN_FEATURES] += e;
+                }
+            }
+            for c in 0..5 {
+                for j in 0..=PATTERN_FEATURES {
+                    let decay = if j < PATTERN_FEATURES { 1e-3 } else { 0.0 };
+                    let g = grad[c][j] / count + decay * model.weights[c][j];
+                    velocity[c][j] = 0.9 * velocity[c][j] - 0.2 * g;
+                    model.weights[c][j] += velocity[c][j];
+                }
+            }
+        }
+        model
+    }
+    fn standard(&self, features: &[f64; PATTERN_FEATURES]) -> [f64; PATTERN_FEATURES] {
+        std::array::from_fn(|j| (features[j] - self.mean[j]) / self.std[j])
+    }
+    fn softmax(&self, x: &[f64; PATTERN_FEATURES]) -> [f64; 5] {
+        let (mut p, mut top, mut total) = ([0.0; 5], f64::NEG_INFINITY, 0.0);
+        for (z, w) in p.iter_mut().zip(&self.weights) {
+            *z = w[PATTERN_FEATURES];
+            for (a, b) in w.iter().zip(x) {
+                *z += a * b;
+            }
+            top = top.max(*z);
+        }
+        for z in p.iter_mut() {
+            *z = (*z - top).exp();
+            total += *z;
+        }
+        for z in p.iter_mut() {
+            *z /= total;
+        }
+        p
+    }
+    /// Probability of each label in `PATTERNS`; the values sum to 1.
+    fn probabilities(&self, features: &[f64; PATTERN_FEATURES]) -> [f64; 5] {
+        self.softmax(&self.standard(features))
+    }
+}
+/// Shared model, trained once on synthetic windows from a fixed seed.
+fn pattern_model() -> &'static PatternModel {
+    static MODEL: std::sync::OnceLock<PatternModel> = std::sync::OnceLock::new();
+    MODEL.get_or_init(|| PatternModel::train(&synthetic_patterns(0x5EED_7EAD, 120)))
+}
+/// Probabilities of the `PATTERNS` labels for the valid readings of the shown
+/// range. Exploratory indication only: trained only on synthetic data, not
+/// calibrated on real vessels, and not an alarm.
+fn classify_pattern(times: &[f64], values: &[f64]) -> Option<[f64; 5]> {
+    pattern_features(times, values).map(|f| pattern_model().probabilities(&f))
 }
 fn settings_path() -> PathBuf {
     std::env::current_exe()
@@ -1870,6 +2279,12 @@ impl App {
                                 ui.small(tr!("Shown: {} readings · {} valid","Visibile: {} letture · {} valide",s.count,s.valid));
                                 if s.valid>0 {ui.small(tr!("·  min {:.4}  max {:.4}  mean {:.4}  σ {:.4} {}","·  min {:.4}  max {:.4}  media {:.4}  σ {:.4} {}",s.min,s.max,s.mean,s.std,series.tag.unit));}
                                 if let Some((rises,falls))=s.changes {ui.small(tr!("·  state changes {} (↑ {} · ↓ {}) between consecutive valid readings","·  cambi di stato {} (↑ {} · ↓ {}) tra letture valide consecutive",rises+falls,rises,falls));}
+                                if let Some(p)=v.pattern {
+                                    let mut order=[0,1,2,3,4];order.sort_by(|a,b|p[*b].total_cmp(&p[*a]));
+                                    let name=|i:usize|t(PATTERNS[i].0,PATTERNS[i].1);
+                                    ui.label(RichText::new(tr!("·  pattern (exploratory): {} {:.0}% · {} {:.0}%","·  andamento (indicativo): {} {:.0}% · {} {:.0}%",name(order[0]),p[order[0]]*100.0,name(order[1]),p[order[1]]*100.0)).small())
+                                        .on_hover_text(t("Jev-style classifier: a small logistic regression trained in the app on synthetic windows only. It answers with fixed labels and probabilities; not calibrated on real vessels and not an alarm.","Classificatore in stile Jev: piccola regressione logistica addestrata nell'app solo su finestre sintetiche. Risponde con etichette fisse e probabilita; non e tarato su navi reali e non e un allarme."));
+                                }
                                 if !s.bins.is_empty() && ui.small_button(t("Histogram","Istogramma")).on_hover_text(t("Distribution of the valid readings shown","Distribuzione delle letture valide visibili")).clicked() {cache.histogram.set(!cache.histogram.get());}
                                 if ui.small_button(t("Export CSV","Esporta CSV")).on_hover_text(t("Save the raw readings shown, for Excel","Salva le letture raw visibili, per Excel")).clicked() {export=Some(index);}
                                 if series.tag.kind!="Digital" && ui.selectable_label(cache.show_unusual.get(),RichText::new(t("Unusual","Anomalie")).small()).on_hover_text(t("Isolation Forest on value and change per hour, trained on this signal's loaded readings: circles the most unusual 0.5% among those drawn. Exploratory indication, not an alarm.","Isolation Forest su valore e variazione all'ora, addestrato sulle letture caricate di questo parametro: cerchia lo 0,5% piu insolito tra quelle disegnate. Indicazione esplorativa, non un allarme.")).clicked() {
@@ -2396,6 +2811,17 @@ mod tests {
         assert_eq!(many.iter().filter(|&&s| s > t).count(), 5);
     }
     #[test]
+    fn raw_view_classifies_analog_patterns_only() {
+        let noise = PatternRng(7).normals(400);
+        let ramp: Vec<f64> = (0..400).map(|i| i as f64 * 0.5 + noise[i] * 0.3).collect();
+        let all = raw(&ramp);
+        let key = (all[0].x, all[399].x, 300);
+        let p = RawView::new(&all, key, false).pattern.unwrap();
+        let best = (0..5).max_by(|&a, &b| p[a].total_cmp(&p[b])).unwrap();
+        assert_eq!(PATTERNS[best].0, "drift");
+        assert!(RawView::new(&all, key, true).pattern.is_none());
+    }
+    #[test]
     fn trained_forest_circles_a_drawn_spike_and_needs_enough_readings() {
         let mut state = 11;
         let values: Vec<f64> = (0..3000)
@@ -2518,5 +2944,79 @@ mod tests {
                 .len(),
             1
         );
+    }
+    fn top_pattern(p: [f64; 5]) -> usize {
+        (0..5).fold(0, |best, c| if p[c] > p[best] { c } else { best })
+    }
+    #[test]
+    fn pattern_classifier_is_accurate_on_held_out_synthetic_windows() {
+        let held_out = synthetic_patterns(0xC0FF_EE11, 80);
+        assert!(held_out.len() >= 390);
+        let model = pattern_model();
+        let hits = held_out
+            .iter()
+            .filter(|(x, y)| top_pattern(model.probabilities(x)) == *y)
+            .count();
+        let accuracy = hits as f64 / held_out.len() as f64;
+        assert!(accuracy >= 0.9, "held-out accuracy {accuracy:.3}");
+    }
+    #[test]
+    fn pattern_probabilities_are_finite_and_sum_to_one() {
+        for (x, _) in synthetic_patterns(3, 20) {
+            let p = pattern_model().probabilities(&x);
+            assert!(p.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)));
+            assert!((p.iter().sum::<f64>() - 1.0).abs() < 1e-9, "{p:?}");
+        }
+    }
+    #[test]
+    fn pattern_classification_is_deterministic() {
+        let data = synthetic_patterns(11, 10);
+        assert_eq!(data, synthetic_patterns(11, 10));
+        let (a, b) = (PatternModel::train(&data), PatternModel::train(&data));
+        assert_eq!(a.weights, b.weights);
+        let times: Vec<f64> = (0..50).map(|i| f64::from(i) * 60.0).collect();
+        let values: Vec<f64> = (0..50).map(|i| f64::from(i % 7)).collect();
+        assert_eq!(
+            classify_pattern(&times, &values),
+            classify_pattern(&times, &values)
+        );
+    }
+    #[test]
+    fn pattern_classifier_labels_textbook_signals() {
+        let times: Vec<f64> = (0..200).map(|i| 1.7e9 + f64::from(i) * 60.0).collect();
+        let noise = PatternRng(7).normals(200);
+        let ramp: Vec<f64> = (0..200)
+            .map(|i| 10.0 + 0.05 * f64::from(i) + 0.05 * noise[i as usize])
+            .collect();
+        let constant = vec![42.0; 200];
+        let flat: Vec<f64> = noise.iter().map(|e| 50.0 + e).collect();
+        let mut spike = flat.clone();
+        spike[120] += 30.0;
+        let step: Vec<f64> = (0..200)
+            .map(|i| 50.0 + 0.05 * noise[i] + if i >= 100 { 5.0 } else { 0.0 })
+            .collect();
+        for (values, label) in [
+            (ramp, "drift"),
+            (constant, "stuck"),
+            (flat, "stable"),
+            (spike, "spikes"),
+            (step, "step"),
+        ] {
+            let p = classify_pattern(&times, &values).unwrap();
+            assert_eq!(PATTERNS[top_pattern(p)].0, label, "{p:?}");
+        }
+    }
+    #[test]
+    fn pattern_features_reject_short_or_invalid_input() {
+        let times: Vec<f64> = (0..30).map(f64::from).collect();
+        let values = vec![1.0; 30];
+        assert!(classify_pattern(&times[..19], &values[..19]).is_none());
+        assert!(classify_pattern(&times[..20], &values[..20]).is_some());
+        let mut invalid = values.clone();
+        invalid[5] = f64::NAN;
+        assert!(classify_pattern(&times, &invalid).is_none());
+        let mut late = times.clone();
+        late[29] = f64::INFINITY;
+        assert!(pattern_features(&late, &values).is_none());
     }
 }

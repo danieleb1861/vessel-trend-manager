@@ -39,7 +39,7 @@ visible before they become alarms.
 |---|---|
 | **Every raw reading** | Daily loads keep up to 2 million raw readings in memory; zoom and pan draw the visible range from them, every reading when it fits, otherwise the real first, last, min and max per pixel column. Larger loads fall back to ≤ 800 buckets with the same rule, with a visible warning. |
 | **Fast on large histories** | Background, cancellable, parallel reads. A shorter period of loaded signals comes from memory; a wider one reads only the archives that memory lacks. |
-| **Light analysis** | For the visible range: count, valid share, min, max, mean and σ; digital state changes (counts, no durations); histogram; right-click measure of Δt, Δ and rate per hour between two readings; Isolation Forest marks for unusual readings; CSV export of the raw readings for Excel. |
+| **Light analysis** | For the visible range: count, valid share, min, max, mean and σ; digital state changes (counts, no durations); histogram; right-click measure of Δt, Δ and rate per hour between two readings; Isolation Forest marks for unusual readings; Jev-style pattern classifier; CSV export of the raw readings for Excel. |
 | **Honest plots** | Invalid, overridden, alarm and inhibit flags are marked; gaps and missing archives are shaded, never interpolated. |
 | **Machinery operating limits** | Min/max limits from a CSV file editable in Excel; the zone beyond each limit is shaded, with no rescaling for far limits. |
 | **Daily and weekly sources kept apart** | Raw readings and weekly min/max aggregates (drawn as range bars) are never mixed. |
@@ -107,6 +107,11 @@ follows zoom and pan:
   change per hour, trained in the app on the signal's loaded readings (at most 20,000, fixed
   seed), circles the most unusual 0.5% among the readings drawn. Exploratory, not an alarm:
   it knows no limits and learns from whatever was loaded, faults included.
+- **Pattern** (analog signals): a Jev-style classifier answers "how does this signal behave over
+  the shown range?" with fixed labels and probabilities: stable, drift, step, spikes, stuck. It is
+  a small multinomial logistic regression on nine scale-free features (Theil–Sen trend, linearity,
+  best two-segment split, robust spikes, flatness, roughness, …), trained in the app on synthetic
+  windows only, in milliseconds. Exploratory, not calibrated on real vessels, not an alarm.
 - **Export CSV**: the raw readings shown, with time to the nanosecond, value, unit, validity,
   alarm and inhibit flags, archive file and row; `;` separated, decimal comma in Italian,
   UTF-8 for Excel. Archive text is written so Excel never reads it as a formula.

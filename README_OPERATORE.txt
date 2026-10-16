@@ -92,6 +92,10 @@ e segue zoom e spostamenti:
   cerchia in rosso lo 0,5% di letture piu insolite tra quelle disegnate.
   E un'indicazione da approfondire, non un allarme: non conosce i limiti e
   impara da cio che e stato caricato, compresi eventuali guasti.
+- Andamento (parametri analogici): un piccolo classificatore indica le due
+  descrizioni piu probabili del tratto visibile tra stabile, deriva,
+  gradino, picchi e bloccato, con la probabilita. E addestrato solo su dati
+  sintetici: e un'indicazione da verificare sul grafico, non un allarme.
 - Esporta CSV: salva le letture raw visibili (data e ora, valore, unita,
   validita, allarme, inibizione, file e riga) in un file per Excel, separato
   da punto e virgola, con la virgola decimale in italiano. Scegliere un nome
