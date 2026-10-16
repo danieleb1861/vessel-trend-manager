@@ -1,6 +1,6 @@
 //! Read-only AMS archive adapter and bounded, cancellable background retrieval.
 use crate::t;
-use chrono::{Duration as Span, NaiveDate, NaiveDateTime, Timelike};
+use chrono::{DateTime, Duration as Span, NaiveDate, NaiveDateTime, Timelike};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, config::DbConfig, params};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -21,7 +21,12 @@ pub const MAX_ROWS: usize = 50_000_000;
 /// Upper bound on archive reader threads; the actual count follows the host CPU.
 const MAX_THREADS: usize = 4;
 pub const MAX_BUCKETS: usize = 800;
+/// Daily readings kept raw for drawing (about 32 bytes each); beyond it only the reduced view is kept.
+pub const MAX_RAW: usize = 2_000_000;
+/// A retrieval stops after this long without progress (and a catalog scan after this long in all).
 pub const MAX_SECONDS: u64 = 120;
+/// A retrieval stops after this long in all, even while it progresses.
+pub const MAX_TOTAL_SECONDS: u64 = 600;
 const MAX_ARCHIVES: usize = 20_000;
 const MAX_CATALOG_TAGS: usize = 10_000;
 const MAX_TEXT_BYTES: usize = 1_024;
@@ -93,6 +98,9 @@ impl Catalog {
 }
 
 pub fn timestamp(text: &str) -> Outcome<NaiveDateTime> {
+    if let Some(at) = fixed_timestamp(text) {
+        return Ok(at);
+    }
     NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f").map_err(|_| {
         t(
             "Invalid archive timestamp.",
@@ -101,6 +109,43 @@ pub fn timestamp(text: &str) -> Outcome<NaiveDateTime> {
         .into()
     })
 }
+/// The usual `YYYY-MM-DD HH:MM:SS[.f]` layout, read once per row without the generic parser.
+/// Anything else (other spacing, leap seconds, over nine decimals) is left to chrono.
+fn fixed_timestamp(text: &str) -> Option<NaiveDateTime> {
+    let b = text.as_bytes();
+    if b.len() < 19
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b' '
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let number = |digits: &[u8]| {
+        digits.iter().try_fold(0u32, |n, &c| {
+            c.is_ascii_digit().then(|| n * 10 + u32::from(c - b'0'))
+        })
+    };
+    let nano = match &b[19..] {
+        [] => 0,
+        [b'.', digits @ ..] if (1..=9).contains(&digits.len()) => {
+            number(digits)? * 10u32.pow(9 - digits.len() as u32)
+        }
+        _ => return None,
+    };
+    NaiveDate::from_ymd_opt(
+        number(&b[0..4])? as i32,
+        number(&b[5..7])?,
+        number(&b[8..10])?,
+    )?
+    .and_hms_nano_opt(
+        number(&b[11..13])?,
+        number(&b[14..16])?,
+        number(&b[17..19])?,
+        nano,
+    )
+}
 fn sql_time(t: NaiveDateTime) -> String {
     t.format("%Y-%m-%d %H:%M:%S%.f").to_string()
 }
@@ -108,16 +153,47 @@ fn fingerprint(path: &Path) -> Outcome<(u64, SystemTime)> {
     let m = fs::metadata(path).map_err(|e| e.to_string())?;
     Ok((m.len(), m.modified().map_err(|e| e.to_string())?))
 }
-fn check(cancel: &AtomicBool, deadline: Instant) -> Outcome<()> {
+struct Clock {
+    began: Instant,
+    idle: Duration,
+    total: Duration,
+    /// Milliseconds from `began` to the latest progress.
+    progress: AtomicU64,
+}
+/// Time bound shared by the readers: it passes after `idle` without progress or `total` in all.
+#[derive(Clone)]
+pub struct Deadline(Arc<Clock>);
+impl Deadline {
+    pub fn new(idle: Duration, total: Duration) -> Self {
+        Self(Arc::new(Clock {
+            began: Instant::now(),
+            idle,
+            total,
+            progress: AtomicU64::new(0),
+        }))
+    }
+    /// Restarts the idle bound: readings were received or an archive was completed.
+    fn progress(&self) {
+        let now = self.0.began.elapsed().as_millis() as u64;
+        self.0.progress.fetch_max(now, Ordering::Relaxed);
+    }
+    fn passed(&self) -> bool {
+        let now = self.0.began.elapsed();
+        let last = Duration::from_millis(self.0.progress.load(Ordering::Relaxed));
+        now >= self.0.total || now >= last + self.0.idle
+    }
+}
+fn check(cancel: &AtomicBool, deadline: &Deadline) -> Outcome<()> {
     if cancel.load(Ordering::Relaxed) {
         return Err(t("Loading cancelled.", "Caricamento annullato.").into());
     }
-    if Instant::now() >= deadline {
-        return Err(t(
-            "Time limit reached: shorten the period or reduce the signals.",
-            "Tempo massimo raggiunto: ridurre periodo o parametri.",
-        )
-        .into());
+    if deadline.passed() {
+        return Err(tr!(
+            "Time limit reached ({} s without progress or {} s in all): shorten the period or reduce the signals.",
+            "Tempo massimo raggiunto ({} s senza avanzamento o {} s in tutto): ridurre periodo o parametri.",
+            deadline.0.idle.as_secs(),
+            deadline.0.total.as_secs()
+        ));
     }
     Ok(())
 }
@@ -150,8 +226,9 @@ fn uri(path: &Path) -> Outcome<String> {
     uri.push_str("?mode=ro&immutable=1");
     Ok(uri)
 }
-fn connect(path: &Path, cancel: Arc<AtomicBool>, deadline: Instant) -> Outcome<Connection> {
+fn connect(path: &Path, cancel: Arc<AtomicBool>, deadline: &Deadline) -> Outcome<Connection> {
     check(&cancel, deadline)?;
+    let deadline = deadline.clone();
     // Immutable reads skip a pending WAL or hot journal: refuse such archives instead.
     for suffix in ["-wal", "-journal"] {
         let mut side = path.as_os_str().to_owned();
@@ -190,7 +267,7 @@ fn connect(path: &Path, cancel: Arc<AtomicBool>, deadline: Instant) -> Outcome<C
         .map_err(|e| e.to_string())?;
     con.progress_handler(
         2000,
-        Some(move || cancel.load(Ordering::Relaxed) || Instant::now() >= deadline),
+        Some(move || cancel.load(Ordering::Relaxed) || deadline.passed()),
     )
     .map_err(|e| e.to_string())?;
     // Expected input is ordinary stored tables, never schema-defined queries or virtual tables.
@@ -275,7 +352,8 @@ pub fn scan(folder: &Path, cancel: Arc<AtomicBool>, progress: &dyn Fn(String)) -
         )
         .into());
     }
-    let deadline = Instant::now() + Duration::from_secs(MAX_SECONDS);
+    let limit = Duration::from_secs(MAX_SECONDS);
+    let deadline = &Deadline::new(limit, limit);
     let mut paths = BTreeSet::new();
     for base in [
         folder.to_path_buf(),
@@ -587,6 +665,58 @@ fn sample(
     })
 }
 
+/// One daily reading in compact form; `source` indexes `Trends::sources`, `row_id` its archive row.
+#[derive(Clone, Copy, Debug)]
+pub struct Raw {
+    pub x: f64,
+    pub value: f64,
+    pub row_id: i64,
+    pub source: u32,
+    /// Nanoseconds below the microsecond held by `x`, so the archive time is kept exactly.
+    pub nanos: u16,
+    /// Bit 0: invalid, overridden or not finite; bit 1: alarm; bit 2: inhibit.
+    pub flags: u8,
+}
+impl Raw {
+    fn new(p: &Sample, source: usize) -> Self {
+        Self {
+            x: p.x(),
+            value: p.value,
+            row_id: p.row_id,
+            source: source as u32,
+            nanos: (p.at.nanosecond() % 1000) as u16,
+            flags: u8::from(!p.good()) | u8::from(p.flags[2]) << 1 | u8::from(p.flags[3]) << 2,
+        }
+    }
+    pub fn good(&self) -> bool {
+        self.flags & 1 == 0
+    }
+    /// Nanoseconds since the epoch, exactly as taken from the archive time.
+    pub fn time(&self) -> i64 {
+        (self.x * 1e6).round() as i64 * 1000 + i64::from(self.nanos)
+    }
+    /// A reading served from memory as a sample; the stamp is rebuilt from the time.
+    fn sample(&self, sources: &[PathBuf], description: &Arc<String>) -> Option<Sample> {
+        let at = DateTime::from_timestamp_nanos(self.time()).naive_utc();
+        Some(Sample {
+            at,
+            stamp: at.format("%Y-%m-%d %H:%M:%S%.f").to_string(),
+            value: self.value,
+            low: self.value,
+            high: self.value,
+            flags: [
+                !self.good(),
+                false,
+                self.flags & 2 != 0,
+                self.flags & 4 != 0,
+            ],
+            source: Arc::new(sources.get(self.source as usize)?.clone()),
+            row_id: self.row_id,
+            marker: None,
+            description: description.clone(),
+        })
+    }
+}
 #[derive(Clone, Debug, Default)]
 pub struct Bucket {
     pub first: Option<Sample>,
@@ -599,7 +729,7 @@ pub struct Bucket {
     pub count: usize,
 }
 impl Bucket {
-    fn add(&mut self, p: &Sample) {
+    fn add(&mut self, p: Sample) {
         self.count += 1;
         self.alarm += usize::from(p.flags[2]);
         self.inhibit += usize::from(p.flags[3]);
@@ -607,17 +737,24 @@ impl Bucket {
             self.bad += 1;
             return;
         }
-        if self.first.as_ref().is_none_or(|v| p.key() < v.key()) {
-            self.first = Some(p.clone());
+        let first = self.first.as_ref().is_none_or(|v| p.key() < v.key());
+        let last = self.last.as_ref().is_none_or(|v| p.key() > v.key());
+        let min = self.min.as_ref().is_none_or(|v| p.low < v.low);
+        let max = self.max.as_ref().is_none_or(|v| p.high > v.high);
+        // Clone only for extra slots: in time order a reading usually just becomes `last`.
+        let mut pending: Option<&mut Option<Sample>> = None;
+        for (taken, slot) in [
+            (first, &mut self.first),
+            (last, &mut self.last),
+            (min, &mut self.min),
+            (max, &mut self.max),
+        ] {
+            if taken && let Some(earlier) = pending.replace(slot) {
+                *earlier = Some(p.clone());
+            }
         }
-        if self.last.as_ref().is_none_or(|v| p.key() > v.key()) {
-            self.last = Some(p.clone());
-        }
-        if self.min.as_ref().is_none_or(|v| p.low < v.low) {
-            self.min = Some(p.clone());
-        }
-        if self.max.as_ref().is_none_or(|v| p.high > v.high) {
-            self.max = Some(p.clone());
+        if let Some(slot) = pending {
+            *slot = Some(p);
         }
     }
     /// Folds a later archive's bucket in; same tie rules as `add`, so results match a serial read.
@@ -661,47 +798,92 @@ impl Bucket {
 pub struct Series {
     pub tag: Tag,
     pub buckets: BTreeMap<usize, Bucket>,
+    /// Every daily reading in the period, by time, when `Trends::raw`; otherwise empty.
+    pub raw: Vec<Raw>,
     pub count: usize,
     pub valid_count: usize,
     pub last: Option<Sample>,
     pub previous: Option<Sample>,
     pub minimum: f64,
     pub maximum: f64,
+    /// Latest invalid reading; the latest valid one is each bucket's `last` until `finish`.
+    pub latest_bad: Option<Sample>,
 }
 impl Series {
     fn new(tag: Tag) -> Self {
         Self {
             tag,
             buckets: BTreeMap::new(),
+            raw: Vec::new(),
             count: 0,
             valid_count: 0,
             last: None,
             previous: None,
             minimum: f64::INFINITY,
             maximum: f64::NEG_INFINITY,
+            latest_bad: None,
         }
     }
     fn add(&mut self, p: Sample, index: usize) {
         self.count += 1;
-        if self.last.as_ref().is_none_or(|v| p.key() > v.key()) {
-            self.last = Some(p.clone());
-        }
         if p.good() {
             self.valid_count += 1;
             self.minimum = self.minimum.min(p.low);
             self.maximum = self.maximum.max(p.high);
+        } else if self.latest_bad.as_ref().is_none_or(|v| p.key() > v.key()) {
+            self.latest_bad = Some(p.clone());
         }
-        self.buckets.entry(index).or_default().add(&p);
+        self.buckets.entry(index).or_default().add(p);
+    }
+    /// Sets `last` once all readings are in, with the same earliest-wins tie rule as `add`.
+    fn finish(&mut self) {
+        let latest = self
+            .buckets
+            .values()
+            .filter_map(|b| b.last.as_ref())
+            .chain(self.latest_bad.as_ref())
+            .reduce(|a, b| if b.key() > a.key() { b } else { a });
+        self.last = latest.cloned();
+    }
+    /// Adds a complete raw load of the same signal kept in memory; `map` gives each of its
+    /// archives' index in this load. Its buckets are not rebuilt: valid only for raw drawing.
+    fn absorb(&mut self, known: &Series, map: &[Option<u32>], same_start: bool) -> Outcome<()> {
+        self.raw.reserve(known.raw.len());
+        for r in &known.raw {
+            let source = map.get(r.source as usize).copied().flatten().ok_or(t(
+                "Archives changed: refresh the catalog.",
+                "Archivi cambiati: aggiornare il catalogo.",
+            ))?;
+            self.raw.push(Raw { source, ..*r });
+        }
+        self.count += known.count;
+        self.valid_count += known.valid_count;
+        self.minimum = self.minimum.min(known.minimum);
+        self.maximum = self.maximum.max(known.maximum);
+        if let Some(p) = &known.last
+            && self.last.as_ref().is_none_or(|v| p.key() > v.key())
+        {
+            self.last = Some(p.clone());
+        }
+        // Its record before the period is the right one only when both periods start together.
+        if same_start
+            && let Some(p) = &known.previous
+            && self.previous.as_ref().is_none_or(|v| p.key() > v.key())
+        {
+            self.previous = Some(p.clone());
+        }
+        Ok(())
     }
     fn merge(&mut self, other: Series) {
+        self.raw.extend(other.raw);
         self.count += other.count;
         self.valid_count += other.valid_count;
         self.minimum = self.minimum.min(other.minimum);
         self.maximum = self.maximum.max(other.maximum);
-        if let Some(p) = other.last
-            && self.last.as_ref().is_none_or(|v| p.key() > v.key())
+        if let Some(p) = other.latest_bad
+            && self.latest_bad.as_ref().is_none_or(|v| p.key() > v.key())
         {
-            self.last = Some(p);
+            self.latest_bad = Some(p);
         }
         if let Some(p) = other.previous
             && self.previous.as_ref().is_none_or(|v| p.key() > v.key())
@@ -724,6 +906,17 @@ pub struct Trends {
     pub series: Vec<Series>,
     pub coverage: Vec<(NaiveDateTime, NaiveDateTime)>,
     pub seconds: f64,
+    /// All daily readings are kept in `Series::raw` (at most `MAX_RAW`).
+    pub raw: bool,
+    pub sources: Vec<PathBuf>,
+    /// Readings taken from memory instead of the archives.
+    pub reused: usize,
+}
+fn deadline() -> Deadline {
+    Deadline::new(
+        Duration::from_secs(MAX_SECONDS),
+        Duration::from_secs(MAX_TOTAL_SECONDS),
+    )
 }
 pub fn load(
     catalog: &Catalog,
@@ -731,9 +924,62 @@ pub fn load(
     cancel: Arc<AtomicBool>,
     progress: &dyn Fn(String),
 ) -> Outcome<Trends> {
+    retrieve(catalog, request, None, cancel, &deadline(), progress)
+}
+/// Like `load`, but when `known` is a complete raw load of the same signals inside the new
+/// period, its readings are reused and only the rest of the period is read from the archives.
+pub fn extend(
+    catalog: &Catalog,
+    request: Request,
+    known: &Trends,
+    cancel: Arc<AtomicBool>,
+    progress: &dyn Fn(String),
+) -> Outcome<Trends> {
+    let deadline = &deadline();
+    if known.raw
+        && request.mode == known.request.mode
+        && request.start <= known.request.start
+        && request.end >= known.request.end
+        && request
+            .tags
+            .iter()
+            .all(|n| known.series.iter().any(|s| &s.tag.name == n))
+    {
+        let trends = retrieve(
+            catalog,
+            request.clone(),
+            Some(known),
+            cancel.clone(),
+            deadline,
+            progress,
+        )?;
+        if trends.raw {
+            return Ok(trends);
+        }
+        // Over the raw cap the reduced view needs every reading: the whole period is read.
+    }
+    retrieve(catalog, request, None, cancel, deadline, progress)
+}
+/// Reads the period from the archives. With `known`, its period is skipped and its readings
+/// are added instead; that result is only complete when `raw` (buckets cover the read part only).
+fn retrieve(
+    catalog: &Catalog,
+    request: Request,
+    known: Option<&Trends>,
+    cancel: Arc<AtomicBool>,
+    deadline: &Deadline,
+    progress: &dyn Fn(String),
+) -> Outcome<Trends> {
     request.validate()?;
     let began = Instant::now();
-    let deadline = began + Duration::from_secs(MAX_SECONDS);
+    let skip = known.map(|k| (k.request.start, k.request.end));
+    let reused: usize = known.map_or(0, |k| {
+        k.series
+            .iter()
+            .filter(|s| request.tags.contains(&s.tag.name))
+            .map(|s| s.raw.len())
+            .sum()
+    });
     let archives: Vec<_> = catalog
         .available(request.mode)
         .filter(|a| a.start < request.end && a.end > request.start)
@@ -764,7 +1010,10 @@ pub fn load(
         })
         .collect::<Outcome<_>>()?;
     let width = (request.end - request.start).num_milliseconds() as f64 / request.buckets as f64;
-    let total = AtomicUsize::new(0);
+    // Reused readings count toward the raw cap as if read.
+    let total = AtomicUsize::new(reused);
+    // Raw readings are kept while the rows read stay within MAX_RAW.
+    let keep = AtomicBool::new(request.mode == Mode::Daily);
     let columns = if request.mode == Mode::Weekly {
         "Id, Timestamp, Value, COALESCE(IsInvalid,0), COALESCE(IsOverride,0), COALESCE(IsInAlarm,0), COALESCE(IsInhibit,0), Min, Max, IntervalMarker"
     } else {
@@ -772,8 +1021,21 @@ pub fn load(
     };
     let templates: Vec<_> = series.iter().map(|s| s.tag.clone()).collect();
     // One archive per call, on its own connection; partial series are merged in archive order.
-    let read = |archive: &Archive| -> Outcome<Vec<Series>> {
+    let read = |source: usize, archive: &Archive| -> Outcome<Vec<Series>> {
         let mut partial: Vec<_> = templates.iter().cloned().map(Series::new).collect();
+        let lo = request.start.max(archive.start);
+        let hi = request.end.min(archive.end);
+        // Parts of this archive's period not already in memory; none means it is not opened.
+        let spans: Vec<_> = match skip {
+            Some((a, b)) => [(lo, hi.min(a)), (lo.max(b), hi)]
+                .into_iter()
+                .filter(|(x, y)| x < y)
+                .collect(),
+            None => vec![(lo, hi)],
+        };
+        if spans.is_empty() {
+            return Ok(partial);
+        }
         check(&cancel, deadline)?;
         if fingerprint(&archive.path)? != archive.signature {
             return Err(t(
@@ -785,15 +1047,6 @@ pub fn load(
         let mut run = || -> Outcome<()> {
             let con = connect(&archive.path, cancel.clone(), deadline)?;
             let path = Arc::new(archive.path.clone());
-            let lo = request.start.max(archive.start);
-            let hi = request.end.min(archive.end);
-            let sql_lo = lo
-                .with_nanosecond(0)
-                .ok_or(t("Invalid date.", "Data non valida."))?;
-            let sql_hi = hi
-                .with_nanosecond(0)
-                .and_then(|v| v.checked_add_signed(Span::seconds(i64::from(hi.nanosecond() > 0))))
-                .ok_or(t("Invalid date.", "Data non valida."))?;
             for target in &mut partial {
                 check(&cancel, deadline)?;
                 let tag = con
@@ -848,30 +1101,51 @@ pub fn load(
                             }
                         }
                     }
-                    // Stream indexed rows without ORDER BY or an unbounded raw-series allocation.
-                    let mut stmt = con.prepare(&format!("SELECT {columns} FROM TagValue WHERE TagConfigDynamic=? AND Timestamp>=? AND Timestamp<?")).map_err(|e| e.to_string())?;
-                    let mut rows = stmt
-                        .query(params![id, sql_time(sql_lo), sql_time(sql_hi)])
-                        .map_err(|e| e.to_string())?;
-                    let mut local = 0usize;
-                    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-                        local += 1;
-                        // Shared counter updated in batches to keep threads off one cache line.
-                        if local.is_multiple_of(2048) {
-                            if total.fetch_add(2048, Ordering::Relaxed) + 2048 > MAX_ROWS {
-                                return Err(t("Too many samples", "Troppi campioni").into());
+                    for &(lo, hi) in &spans {
+                        let sql_lo = lo
+                            .with_nanosecond(0)
+                            .ok_or(t("Invalid date.", "Data non valida."))?;
+                        let sql_hi = hi
+                            .with_nanosecond(0)
+                            .and_then(|v| {
+                                v.checked_add_signed(Span::seconds(i64::from(hi.nanosecond() > 0)))
+                            })
+                            .ok_or(t("Invalid date.", "Data non valida."))?;
+                        // Stream indexed rows without ORDER BY or an unbounded raw-series allocation.
+                        let mut stmt = con.prepare(&format!("SELECT {columns} FROM TagValue WHERE TagConfigDynamic=? AND Timestamp>=? AND Timestamp<?")).map_err(|e| e.to_string())?;
+                        let mut rows = stmt
+                            .query(params![id, sql_time(sql_lo), sql_time(sql_hi)])
+                            .map_err(|e| e.to_string())?;
+                        let mut local = 0usize;
+                        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                            local += 1;
+                            // Shared counter updated in batches to keep threads off one cache line.
+                            if local.is_multiple_of(2048) {
+                                let rows = total.fetch_add(2048, Ordering::Relaxed) + 2048;
+                                if rows > MAX_RAW {
+                                    keep.store(false, Ordering::Relaxed);
+                                }
+                                if rows > MAX_ROWS {
+                                    return Err(t("Too many samples", "Troppi campioni").into());
+                                }
+                                deadline.progress();
+                                check(&cancel, deadline)?;
                             }
-                            check(&cancel, deadline)?;
+                            let point =
+                                sample(row, path.clone(), description.clone(), request.mode)?;
+                            if point.at >= lo && point.at < hi {
+                                if keep.load(Ordering::Relaxed) {
+                                    target.raw.push(Raw::new(&point, source));
+                                }
+                                let bucket = (((point.at - request.start).num_milliseconds() as f64
+                                    / width)
+                                    as usize)
+                                    .min(request.buckets - 1);
+                                target.add(point, bucket);
+                            }
                         }
-                        let point = sample(row, path.clone(), description.clone(), request.mode)?;
-                        if point.at >= lo && point.at < hi {
-                            let bucket = (((point.at - request.start).num_milliseconds() as f64
-                                / width) as usize)
-                                .min(request.buckets - 1);
-                            target.add(point, bucket);
-                        }
+                        total.fetch_add(local % 2048, Ordering::Relaxed);
                     }
-                    total.fetch_add(local % 2048, Ordering::Relaxed);
                 }
             }
             Ok(())
@@ -910,6 +1184,7 @@ pub fn load(
     for (batch_index, batch) in archives.chunks(threads).enumerate() {
         let next = AtomicUsize::new(0);
         let stop = AtomicBool::new(false);
+        let offset = batch_index * threads;
         let mut parts: Vec<Option<Outcome<Vec<Series>>>> = batch.iter().map(|_| None).collect();
         std::thread::scope(|scope| {
             let (sender, receiver) = mpsc::channel();
@@ -922,7 +1197,7 @@ pub fn load(
                         let Some(archive) = archives.get(index) else {
                             break;
                         };
-                        let part = read(archive);
+                        let part = read(offset + index, archive);
                         if part.is_err() {
                             stop.store(true, Ordering::Relaxed);
                         }
@@ -934,6 +1209,7 @@ pub fn load(
             }
             drop(sender);
             for (done, (index, part)) in receiver.iter().enumerate() {
+                deadline.progress();
                 progress(tr!(
                     "Reading {}/{} archives | {} samples",
                     "Lettura {}/{} archivi | {} campioni",
@@ -950,7 +1226,12 @@ pub fn load(
                 "Incomplete read: retry.",
                 "Lettura incompleta: riprovare.",
             ))??;
-            for (target, piece) in series.iter_mut().zip(part) {
+            for (target, mut piece) in series.iter_mut().zip(part) {
+                // Over the raw cap, drop what was kept so far instead of holding it to the end.
+                if !keep.load(Ordering::Relaxed) {
+                    target.raw = Vec::new();
+                    piece.raw = Vec::new();
+                }
                 target.merge(piece);
             }
         }
@@ -965,6 +1246,33 @@ pub fn load(
             read_rows
         ));
     }
+    let raw = keep.load(Ordering::Relaxed) && read_rows <= MAX_RAW;
+    // Archive index in this load of each archive a reused reading came from.
+    let index: BTreeMap<&Path, u32> = archives
+        .iter()
+        .enumerate()
+        .map(|(i, a)| (a.path.as_path(), i as u32))
+        .collect();
+    let map: Vec<Option<u32>> = known.map_or_else(Vec::new, |k| {
+        k.sources
+            .iter()
+            .map(|p| index.get(p.as_path()).copied())
+            .collect()
+    });
+    for s in &mut series {
+        s.finish();
+        if let Some(k) = known
+            && let Some(old) = k.series.iter().find(|o| o.tag.name == s.tag.name)
+        {
+            s.absorb(old, &map, request.start == k.request.start)?;
+        }
+        if raw {
+            // Archives are read without ORDER BY; same (time, row) order as `Sample::key`.
+            s.raw.sort_by_key(|r| (r.time(), r.row_id));
+        } else {
+            s.raw = Vec::new();
+        }
+    }
     let coverage = archives
         .iter()
         .map(|a| (a.start.max(request.start), a.end.min(request.end)))
@@ -974,6 +1282,76 @@ pub fn load(
         series,
         coverage,
         seconds: began.elapsed().as_secs_f64(),
+        raw,
+        sources: archives.iter().map(|a| a.path.clone()).collect(),
+        reused,
+    })
+}
+
+/// Serves a request from an earlier complete raw load without reading the archives: same
+/// source, signals among those loaded, period inside the loaded one. `None` means read from disk.
+pub fn narrow(cache: &Trends, request: &Request) -> Option<Trends> {
+    let began = Instant::now();
+    let loaded = &cache.request;
+    let nanos = |t: NaiveDateTime| t.and_utc().timestamp_nanos_opt();
+    let (lo, hi) = (nanos(request.start)?, nanos(request.end)?);
+    if !cache.raw
+        || request.mode != loaded.mode
+        || request.start < loaded.start
+        || request.end > loaded.end
+        || request.validate().is_err()
+    {
+        return None;
+    }
+    let coverage: Vec<_> = cache
+        .coverage
+        .iter()
+        .map(|&(a, b)| (a.max(request.start), b.min(request.end)))
+        .filter(|(a, b)| a < b)
+        .collect();
+    if coverage.is_empty() {
+        return None;
+    }
+    let mut series = Vec::new();
+    for name in &request.tags {
+        let s = cache.series.iter().find(|s| &s.tag.name == name)?;
+        let first = s.raw.partition_point(|r| r.time() < lo);
+        let end = s.raw.partition_point(|r| r.time() < hi);
+        let description = Arc::new(s.tag.description.clone());
+        // The original sample, with its archive stamp, is kept when it is the same row.
+        let sample = |r: &Raw, original: &Option<Sample>| {
+            original
+                .as_ref()
+                .filter(|p| {
+                    p.row_id == r.row_id && cache.sources.get(r.source as usize) == Some(&*p.source)
+                })
+                .cloned()
+                .or_else(|| r.sample(&cache.sources, &description))
+        };
+        let mut part = Series::new(s.tag.clone());
+        part.raw = s.raw[first..end].to_vec();
+        part.count = part.raw.len();
+        for r in part.raw.iter().filter(|r| r.good()) {
+            part.valid_count += 1;
+            part.minimum = part.minimum.min(r.value);
+            part.maximum = part.maximum.max(r.value);
+        }
+        part.last = part.raw.last().and_then(|r| sample(r, &s.last));
+        part.previous = match first.checked_sub(1) {
+            Some(i) => sample(&s.raw[i], &None),
+            None => s.previous.clone(),
+        };
+        series.push(part);
+    }
+    let reused = series.iter().map(|s| s.count).sum();
+    Some(Trends {
+        request: request.clone(),
+        series,
+        coverage,
+        seconds: began.elapsed().as_secs_f64(),
+        raw: true,
+        sources: cache.sources.clone(),
+        reused,
     })
 }
 
@@ -981,7 +1359,8 @@ pub enum Job {
     Scan(PathBuf),
     /// Builds the synthetic demo archives in the folder if needed, then scans it.
     Demo(PathBuf),
-    Load(Arc<Catalog>, Request),
+    /// Reads trends; readings of an earlier complete raw load, when given, are reused if they fit.
+    Load(Arc<Catalog>, Request, Option<Arc<Trends>>),
 }
 pub enum Loaded {
     Catalog(Arc<Catalog>),
@@ -1041,11 +1420,12 @@ impl Manager {
                         Some((generation, text));
                 };
                 let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                check(&cancel,Instant::now()+Duration::from_secs(MAX_SECONDS))?;
+                if cancel.load(Ordering::Relaxed) {return Err(t("Loading cancelled.", "Caricamento annullato.").into());}
                 match job {
                     Job::Scan(folder)=>scan(&folder,cancel.clone(),&progress).map(|v| Loaded::Catalog(Arc::new(v))),
                     Job::Demo(folder)=>crate::demo::ensure(&folder).and_then(|_| scan(&folder,cancel.clone(),&progress)).map(|v| Loaded::Catalog(Arc::new(v))),
-                    Job::Load(catalog,request)=>load(&catalog,request,cancel.clone(),&progress).map(Loaded::Trends),
+                    Job::Load(catalog,request,None)=>load(&catalog,request,cancel.clone(),&progress).map(Loaded::Trends),
+                    Job::Load(catalog,request,Some(known))=>extend(&catalog,request,&known,cancel.clone(),&progress).map(Loaded::Trends),
                 }
             })).unwrap_or_else(|_| Err(t("Read stopped by an internal error. Retry with a verified archive.", "Lettura interrotta per un errore interno. Riprovare con un archivio verificato.").into()));
                 if generation == worker.generation.load(Ordering::Relaxed) {
@@ -1065,13 +1445,17 @@ impl Manager {
             generation: 0,
         }
     }
-    pub fn submit(&mut self, job: Job) {
+    /// Cancels the running job and discards its result, as a new submission does.
+    pub fn supersede(&mut self) {
         self.cancel();
         self.cancel = Arc::new(AtomicBool::new(false));
         self.generation += 1;
         self.shared
             .generation
             .store(self.generation, Ordering::Relaxed);
+    }
+    pub fn submit(&mut self, job: Job) {
+        self.supersede();
         *self.shared.output.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self
             .shared

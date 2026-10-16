@@ -2,7 +2,8 @@
 use crate::{
     Options,
     archive::{
-        self, Catalog, Job, Loaded, MAX_BUCKETS, MAX_TAGS, Manager, Mode, Request, Sample, Trends,
+        self, Catalog, Job, Loaded, MAX_BUCKETS, MAX_RAW, MAX_TAGS, Manager, Mode, Raw, Request,
+        Sample, Trends,
     },
     set_italian, t,
 };
@@ -11,6 +12,7 @@ use eframe::egui::{self, Color32, RichText, Stroke};
 use egui_plot::{Line, Plot, Points, Polygon};
 use serde::{Deserialize, Serialize};
 use std::{
+    cell::RefCell,
     collections::BTreeMap,
     fs,
     io::{Read, Write},
@@ -186,67 +188,165 @@ fn read_limits(path: &Path) -> Result<BTreeMap<String, Limit>, String> {
         ))?;
     parse_limits(&text)
 }
+/// Native line segments from groups of kept `[x, value]` readings. A disconnected group (invalid
+/// readings, or digital states not all kept) and daily gaps over 900 s break the line.
+fn lines(
+    groups: impl IntoIterator<Item = (Vec<[f64; 2]>, bool)>,
+    digital: bool,
+    daily: bool,
+) -> Vec<Vec<[f64; 2]>> {
+    // x holds whole microseconds, so the gap rule matches `num_seconds() > 900` exactly.
+    let micros = |x: f64| (x * 1e6).round();
+    let mut segments = Vec::new();
+    let mut line = Vec::new();
+    let mut prior: Option<[f64; 2]> = None;
+    for (retained, disconnected) in groups {
+        if disconnected {
+            if line.len() > 1 {
+                segments.push(std::mem::take(&mut line));
+            } else {
+                line.clear();
+            }
+            prior = None;
+        }
+        for p in retained {
+            if let Some(last) = prior {
+                if (daily && micros(p[0]) - micros(last[0]) >= 901e6) || disconnected {
+                    if line.len() > 1 {
+                        segments.push(std::mem::take(&mut line));
+                    } else {
+                        line.clear();
+                    }
+                } else if digital {
+                    line.push([p[0], last[1]]);
+                }
+            }
+            line.push(p);
+            prior = Some(p);
+        }
+        if disconnected {
+            if line.len() > 1 && !digital {
+                segments.push(std::mem::take(&mut line));
+            } else {
+                line.clear();
+            }
+            prior = None;
+        }
+    }
+    if line.len() > 1 {
+        segments.push(line);
+    }
+    segments
+}
 struct CachedPlot {
     points: Vec<Sample>,
     segments: Vec<Vec<[f64; 2]>>,
     bars: Vec<Vec<[f64; 2]>>,
+    /// Raw drawing of the last plot range, rebuilt only when the range or width changes.
+    view: RefCell<Option<RawView>>,
 }
 impl CachedPlot {
     fn new(series: &archive::Series, mode: Mode) -> Self {
         let mut points = Vec::new();
-        let mut segments = Vec::new();
-        let mut line = Vec::new();
+        let mut groups = Vec::new();
         let mut bars = Vec::new();
         let digital = series.tag.kind == "Digital";
-        let mut prior: Option<Sample> = None;
         for bucket in series.buckets.values() {
             let retained = bucket.points();
             let disconnected = bucket.bad > 0 || (digital && retained.len() < bucket.count);
-            if disconnected {
-                if line.len() > 1 {
-                    segments.push(std::mem::take(&mut line));
-                } else {
-                    line.clear();
-                }
-                prior = None;
-            }
+            groups.push((
+                retained.iter().map(|p| [p.x(), p.value]).collect(),
+                disconnected,
+            ));
             for p in retained {
-                if let Some(last) = prior.as_ref() {
-                    if (mode == Mode::Daily && (p.at - last.at).num_seconds() > 900) || disconnected
-                    {
-                        if line.len() > 1 {
-                            segments.push(std::mem::take(&mut line));
-                        } else {
-                            line.clear();
-                        }
-                    } else if digital {
-                        line.push([p.x(), last.value]);
-                    }
-                }
-                line.push([p.x(), p.value]);
                 if mode == Mode::Weekly {
                     bars.push(vec![[p.x(), p.low], [p.x(), p.high]]);
                 }
                 points.push(p.clone());
-                prior = Some(p.clone());
             }
-            if disconnected {
-                if line.len() > 1 && !digital {
-                    segments.push(std::mem::take(&mut line));
-                } else {
-                    line.clear();
-                }
-                prior = None;
-            }
-        }
-        if line.len() > 1 {
-            segments.push(line);
         }
         Self {
             points,
-            segments,
+            segments: lines(groups, digital, mode == Mode::Daily),
             bars,
+            view: RefCell::new(None),
         }
+    }
+}
+/// Raw readings drawn for one x range and plot width: every reading when they fit, otherwise
+/// the first, last, minimum and maximum real reading of each pixel column.
+struct RawView {
+    key: (f64, f64, usize),
+    /// Indices into `Series::raw` of the valid readings drawn.
+    points: Vec<usize>,
+    segments: Vec<Vec<[f64; 2]>>,
+    /// x of groups with invalid/overridden readings, alarms and inhibits.
+    flags: [Vec<f64>; 3],
+}
+impl RawView {
+    fn new(raw: &[Raw], key: (f64, f64, usize), digital: bool) -> Self {
+        let mut view = Self {
+            key,
+            points: Vec::new(),
+            segments: Vec::new(),
+            flags: Default::default(),
+        };
+        let (x0, x1, width) = key;
+        // Half a view of margin on each side hides the one-frame bounds lag while panning.
+        let (lo, hi) = (x0 - (x1 - x0) / 2.0, x1 + (x1 - x0) / 2.0);
+        if !(lo.is_finite() && hi.is_finite() && hi > lo) {
+            return view;
+        }
+        let columns = width.max(1) * 2;
+        // One reading beyond each edge keeps lines running off the frame.
+        let first = raw.partition_point(|r| r.x < lo).saturating_sub(1);
+        let last = (raw.partition_point(|r| r.x <= hi) + 1).min(raw.len());
+        let every = last - first <= columns * 2;
+        let column =
+            |r: &Raw| (((r.x - lo) / (hi - lo) * columns as f64).floor() as usize).min(columns - 1);
+        let mut groups = Vec::new();
+        let mut members = Vec::new();
+        let mut index = first;
+        while index < last {
+            let group = column(&raw[index]);
+            members.clear();
+            while index < last && (members.is_empty() || (!every && column(&raw[index]) == group)) {
+                members.push(index);
+                index += 1;
+            }
+            let good: Vec<usize> = members.iter().copied().filter(|&i| raw[i].good()).collect();
+            let by_value = |a: &&usize, b: &&usize| raw[**a].value.total_cmp(&raw[**b].value);
+            let mut kept: Vec<usize> = [
+                good.first(),
+                good.last(),
+                good.iter().min_by(by_value),
+                good.iter().max_by(by_value),
+            ]
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+            kept.sort_unstable();
+            kept.dedup();
+            let x = if every {
+                raw[members[0]].x
+            } else {
+                lo + (group as f64 + 0.5) * (hi - lo) / columns as f64
+            };
+            for (bit, flags) in view.flags.iter_mut().enumerate() {
+                if members.iter().any(|&i| raw[i].flags & (1 << bit) != 0) {
+                    flags.push(x);
+                }
+            }
+            let bad = good.len() < members.len();
+            groups.push((
+                kept.iter().map(|&i| [raw[i].x, raw[i].value]).collect(),
+                bad || (digital && kept.len() < members.len()),
+            ));
+            view.points.extend(kept);
+        }
+        view.segments = lines(groups, digital, true);
+        view
     }
 }
 fn settings_path() -> PathBuf {
@@ -345,7 +445,10 @@ fn date_grid(input: egui_plot::GridInput) -> Vec<egui_plot::GridMark> {
 pub struct App {
     manager: Manager,
     catalog: Option<Arc<Catalog>>,
-    trends: Option<Trends>,
+    trends: Option<Arc<Trends>>,
+    /// Last complete raw load from disk: shorter periods of its signals are served from it.
+    /// Memory only; dropped when the archive folder is closed or reopened.
+    cache: Option<Arc<Trends>>,
     plots: Vec<CachedPlot>,
     folder: String,
     search: String,
@@ -434,6 +537,7 @@ impl App {
             manager: Manager::new(),
             catalog: None,
             trends: None,
+            cache: None,
             plots: Vec::new(),
             folder,
             search: String::new(),
@@ -528,6 +632,7 @@ impl App {
         self.catalog = None;
         self.selected.clear();
         self.trends = None;
+        self.cache = None;
         self.plots.clear();
         self.group.clear();
         self.error = None;
@@ -571,7 +676,17 @@ impl App {
         })();
         match request {
             Ok(r) => {
-                self.manager.submit(Job::Load(catalog.clone(), r));
+                if let Some(t) = self.cache.as_ref().and_then(|c| archive::narrow(c, &r)) {
+                    // Nothing to read: a running load is dropped and the result shown at once.
+                    self.manager.supersede();
+                    self.busy = false;
+                    self.error = None;
+                    self.show_trends(t, true);
+                    return;
+                }
+                // A wider period of the cached signals reads only what memory lacks.
+                self.manager
+                    .submit(Job::Load(catalog.clone(), r, self.cache.clone()));
                 self.busy = true;
                 self.error = None;
                 self.trends = None;
@@ -632,33 +747,63 @@ impl App {
                         }
                     }
                 }
-                Ok(Loaded::Trends(t)) => {
-                    self.status = tr!(
-                        "{} readings · {} plotted points · {:.2} s",
-                        "{} letture · {} punti nel grafico · {:.2} s",
-                        t.series.iter().map(|s| s.count).sum::<usize>(),
-                        t.series
-                            .iter()
-                            .flat_map(|s| s.buckets.values())
-                            .map(|b| b.points().len())
-                            .sum::<usize>(),
-                        t.seconds
-                    );
-                    self.plots = t
-                        .series
-                        .iter()
-                        .map(|s| CachedPlot::new(s, t.request.mode))
-                        .collect();
-                    self.trends = Some(t);
-                    self.reset = true;
-                    self.smoke_stage = 2;
-                }
+                Ok(Loaded::Trends(t)) => self.show_trends(t, false),
                 Err(e) => {
                     self.status = t("Operation finished", "Operazione terminata").into();
                     self.error = Some(e);
                 }
             }
         }
+    }
+    /// Shows loaded trends; a complete raw load read from disk becomes the memory cache.
+    fn show_trends(&mut self, t: Trends, from_memory: bool) {
+        self.status = if from_memory {
+            tr!(
+                "{} readings · all raw, from memory · {:.2} s",
+                "{} letture · tutte raw, dalla memoria · {:.2} s",
+                t.series.iter().map(|s| s.count).sum::<usize>(),
+                t.seconds
+            )
+        } else if t.raw && t.reused > 0 {
+            tr!(
+                "{} readings ({} from memory) · all raw, zoom for detail · {:.2} s",
+                "{} letture ({} dalla memoria) · tutte raw, zoom per il dettaglio · {:.2} s",
+                t.series.iter().map(|s| s.count).sum::<usize>(),
+                t.reused,
+                t.seconds
+            )
+        } else if t.raw {
+            tr!(
+                "{} readings · all raw, zoom for detail · {:.2} s",
+                "{} letture · tutte raw, zoom per il dettaglio · {:.2} s",
+                t.series.iter().map(|s| s.count).sum::<usize>(),
+                t.seconds
+            )
+        } else {
+            tr!(
+                "{} readings · {} plotted points · {:.2} s",
+                "{} letture · {} punti nel grafico · {:.2} s",
+                t.series.iter().map(|s| s.count).sum::<usize>(),
+                t.series
+                    .iter()
+                    .flat_map(|s| s.buckets.values())
+                    .map(|b| b.points().len())
+                    .sum::<usize>(),
+                t.seconds
+            )
+        };
+        self.plots = t
+            .series
+            .iter()
+            .map(|s| CachedPlot::new(s, t.request.mode))
+            .collect();
+        let t = Arc::new(t);
+        if t.raw && !from_memory {
+            self.cache = Some(t.clone());
+        }
+        self.trends = Some(t);
+        self.reset = true;
+        self.smoke_stage = 2;
     }
     fn save_settings(&mut self) {
         if self.options.smoke {
@@ -1183,6 +1328,16 @@ impl App {
                 ),
             );
         }
+        if trends.request.mode == Mode::Daily && !trends.raw {
+            ui.colored_label(
+                Color32::from_rgb(155, 94, 20),
+                tr!(
+                    "Reduced view: over {} million readings. Shorten the period or reduce the signals to see every raw reading.",
+                    "Vista ridotta: oltre {} milioni di letture. Ridurre il periodo o i parametri per vedere tutte le letture raw.",
+                    MAX_RAW / 1_000_000
+                ),
+            );
+        }
         let plot_height = if trends.series.len() <= 2 {
             ((ui.available_height() - 80.0) / trends.series.len().max(1) as f32 - 90.0).max(190.0)
         } else {
@@ -1229,18 +1384,37 @@ impl App {
                                 if a>cursor {plot.polygon(Polygon::new(t("Missing archive","Archivio mancante"),vec![[cursor,low],[a,low],[a,high],[cursor,high]]).fill_color(Color32::from_gray(225)).stroke(Stroke::NONE).allow_hover(false));}
                                 cursor=cursor.max(b);
                             }
-                            for line in &cache.segments {plot.line(Line::new("Trend",line.clone()).color(COLORS[index]).width(1.6_f32));}
-                            plot.points(Points::new(t("Retained readings","Letture conservate"),cache.points.iter().map(|p|[p.x(),p.value]).collect::<Vec<_>>()).radius(2.2_f32).color(COLORS[index]));
                             let mut flags:[Vec<[f64;2]>;3]=Default::default();
-                            for (i,bucket) in &series.buckets {
-                                let x=start+(*i as f64+0.5)*(end-start)/trends.request.buckets as f64;
-                                for (j,present) in [bucket.bad>0,bucket.alarm>0,bucket.inhibit>0].into_iter().enumerate() {
-                                    if present {flags[j].push([x,low+(high-low)*j as f64*0.04]);}
+                            if trends.raw {
+                                // Rebuilt from the raw readings only when the shown range or width changes.
+                                let b=plot.plot_bounds();
+                                let key=(b.min()[0],b.max()[0],plot.transform().frame().width().max(1.0) as usize);
+                                let mut view=cache.view.borrow_mut();
+                                if view.as_ref().is_none_or(|v|v.key!=key) {*view=Some(RawView::new(&series.raw,key,series.tag.kind=="Digital"));}
+                                if let Some(v)=view.as_ref() {
+                                    for line in &v.segments {plot.line(Line::new("Trend",line.clone()).color(COLORS[index]).width(1.6_f32));}
+                                    plot.points(Points::new(t("Raw readings","Letture raw"),v.points.iter().map(|&i|[series.raw[i].x,series.raw[i].value]).collect::<Vec<_>>()).radius(2.2_f32).color(COLORS[index]));
+                                    for (j,xs) in v.flags.iter().enumerate() {flags[j]=xs.iter().map(|&x|[x,low+(high-low)*j as f64*0.04]).collect();}
+                                }
+                            } else {
+                                for line in &cache.segments {plot.line(Line::new("Trend",line.clone()).color(COLORS[index]).width(1.6_f32));}
+                                plot.points(Points::new(t("Retained readings","Letture conservate"),cache.points.iter().map(|p|[p.x(),p.value]).collect::<Vec<_>>()).radius(2.2_f32).color(COLORS[index]));
+                                for (i,bucket) in &series.buckets {
+                                    let x=start+(*i as f64+0.5)*(end-start)/trends.request.buckets as f64;
+                                    for (j,present) in [bucket.bad>0,bucket.alarm>0,bucket.inhibit>0].into_iter().enumerate() {
+                                        if present {flags[j].push([x,low+(high-low)*j as f64*0.04]);}
+                                    }
                                 }
                             }
                             for (points,color,label) in [(std::mem::take(&mut flags[0]),Color32::from_rgb(220,139,29),t("Invalid / overridden","Non valide / forzate")),(std::mem::take(&mut flags[1]),Color32::from_rgb(192,53,60),t("Alarm recorded","Allarme registrato")),(std::mem::take(&mut flags[2]),Color32::from_rgb(139,83,171),t("Inhibit recorded","Inibizione registrata"))] {plot.points(Points::new(label,points).color(color).radius(3.0_f32));}
                             plot.pointer_coordinate()
                         });
+                    // Bounds seen inside the plot lag one frame: redraw until the raw view matches them.
+                    if trends.raw {
+                        let b=response.transform.bounds();
+                        let key=(b.min()[0],b.max()[0],response.transform.frame().width().max(1.0) as usize);
+                        if cache.view.borrow().as_ref().is_none_or(|v|v.key!=key) {ui.ctx().request_repaint();}
+                    }
                     let painter=ui.painter().with_clip_rect(*response.transform.frame());
                     for bar in &cache.bars {
                         painter.line_segment([response.transform.position_from_point(&bar[0].into()),response.transform.position_from_point(&bar[1].into())],Stroke::new(1.0_f32,COLORS[index].gamma_multiply(0.35)));
@@ -1257,7 +1431,20 @@ impl App {
                             if edge==y {painter.extend(egui::Shape::dashed_line(&[egui::pos2(frame.left(),y),egui::pos2(frame.right(),y)],Stroke::new(1.0_f32,Color32::from_rgba_unmultiplied(192,53,60,150)),6.0,4.0));}
                         }
                     }
-                    if response.response.hovered()
+                    if trends.raw && response.response.hovered()
+                        && let Some(pointer)=response.inner {
+                            let view=cache.view.borrow();
+                            let near=view.as_ref().and_then(|v|v.points.iter().map(|&i|&series.raw[i]).min_by(|a,b|(a.x-pointer.x).abs().total_cmp(&(b.x-pointer.x).abs())));
+                            if let Some(r)=near {
+                                response.response.on_hover_ui(|ui| {
+                                    let at=DateTime::from_timestamp_micros((r.x*1e6).round() as i64).map(|t|t.format("%Y-%m-%d %H:%M:%S%.f").to_string()).unwrap_or_default();
+                                    ui.label(series.tag.description.as_str());ui.label(format!("{} · {:.6} {}",at,r.value,series.tag.unit));
+                                    ui.small(tr!("{} · row {}","{} · riga {}",trends.sources.get(r.source as usize).and_then(|p|p.file_name()).unwrap_or_default().to_string_lossy(),r.row_id));
+                                    ui.small(tr!("Alarm: {} · Inhibit: {}","Allarme: {} · Inibizione: {}",r.flags&2!=0,r.flags&4!=0));
+                                });
+                            }
+                        }
+                    else if response.response.hovered()
                         && let Some(pointer)=response.inner {
                             let near=cache.points.iter().min_by(|a,b|(a.x()-pointer.x).abs().total_cmp(&(b.x()-pointer.x).abs()));
                             if let Some(p)=near {
@@ -1436,12 +1623,14 @@ mod tests {
                     inhibit: 0,
                 },
             )]),
+            raw: Vec::new(),
             count,
             valid_count: count - bad,
             last: Some(last),
             previous: None,
             minimum: 0.0,
             maximum: 1.0,
+            latest_bad: None,
         }
     }
     #[test]
@@ -1530,6 +1719,54 @@ mod tests {
         assert_eq!(fs::read(&preferences).unwrap(), b"{\"language\":\"en\"}");
         assert_eq!(fs::read(&old_temp).unwrap(), b"preserve sentinel");
         fs::remove_dir_all(folder).unwrap();
+    }
+    fn raw(values: &[f64]) -> Vec<Raw> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, &value)| Raw {
+                x: 1_700_000_000.0 + i as f64,
+                value,
+                row_id: i as i64 + 1,
+                source: 0,
+                nanos: 0,
+                flags: u8::from(!value.is_finite()),
+            })
+            .collect()
+    }
+    #[test]
+    fn raw_view_draws_every_reading_that_fits_and_breaks_on_invalid() {
+        let all = raw(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+        let view = RawView::new(&all, (all[0].x, all[4].x, 100), false);
+        assert_eq!(view.points, vec![0, 1, 2, 3, 4]);
+        assert_eq!(view.segments.len(), 1);
+        let gap = raw(&[1.0, 2.0, f64::NAN, 4.0, 5.0]);
+        let view = RawView::new(&gap, (gap[0].x, gap[4].x, 100), false);
+        assert_eq!(view.points, vec![0, 1, 3, 4]);
+        assert_eq!(view.segments.len(), 2);
+        assert_eq!(view.flags[0], vec![gap[2].x]);
+        // Empty or degenerate bounds draw nothing instead of panicking.
+        assert!(RawView::new(&[], (0.0, 1.0, 100), false).points.is_empty());
+        assert!(
+            RawView::new(&all, (f64::NAN, 1.0, 100), false)
+                .points
+                .is_empty()
+        );
+    }
+    #[test]
+    fn raw_view_reduction_keeps_real_extremes_and_zoom_shows_all() {
+        let values: Vec<f64> = (0..100_000).map(|i| (i as f64 * 0.01).sin()).collect();
+        let mut all = raw(&values);
+        all[54_321].value = 9.0;
+        all[12_345].value = -9.0;
+        let key = (all[0].x, all[99_999].x, 200);
+        let view = RawView::new(&all, key, false);
+        assert!(view.points.len() <= 4 * 2 * 200);
+        assert!(view.points.contains(&54_321) && view.points.contains(&12_345));
+        assert!(view.points.windows(2).all(|w| w[0] < w[1]));
+        // Zoomed to 100 readings on a 200 px plot: every raw reading in range is drawn.
+        let view = RawView::new(&all, (all[50_000].x, all[50_099].x, 200), false);
+        assert!((50_000..50_100).all(|i| view.points.contains(&i)));
     }
     #[test]
     fn reduced_digital_plot_does_not_invent_state_duration() {

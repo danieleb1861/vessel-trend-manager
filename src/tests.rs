@@ -112,6 +112,159 @@ fn boundaries_quality_extremes_and_old_seeds() {
         vec![10.0, 100.0, -5.0, 12.0]
     );
     assert_eq!(b.points()[1].stamp, "2026-09-01 00:00:01.1234567");
+    // Every daily reading in the period is kept raw, by time, with its quality flags and row.
+    assert!(t.raw);
+    assert_eq!(s.raw.len(), s.count);
+    assert_eq!(s.raw.iter().filter(|r| r.good()).count(), s.valid_count);
+    assert!(s.raw.windows(2).all(|w| w[0].x <= w[1].x));
+    assert_eq!(
+        s.raw.iter().map(|r| r.flags >> 1 & 1).sum::<u8>() as usize,
+        b.alarm
+    );
+    assert!(
+        s.raw
+            .iter()
+            .all(|r| t.sources[r.source as usize].exists() && r.row_id > 0)
+    );
+    let mut weekly = request();
+    weekly.mode = Mode::Weekly;
+    let w = result(&f, weekly);
+    assert!(!w.raw && w.series[0].raw.is_empty());
+}
+#[test]
+fn fixed_timestamp_layout_matches_the_generic_parser() {
+    for text in [
+        "2026-09-01 00:00:01",
+        "2026-09-01 00:00:01.1234567",
+        "2026-09-01 23:59:59.5",
+        "2026-12-31 12:34:56.123456789",
+        "2024-02-29 08:00:00.000",
+    ] {
+        let generic = NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f").unwrap();
+        assert_eq!(timestamp(text).unwrap(), generic, "{text}");
+    }
+    // Unusual layouts fall back to the generic parser, which keeps its own rules.
+    for text in [
+        "2026-09-01 00:00:60",
+        "2026-09-01 00:00:01.1234567891",
+        "2026-02-30 00:00:00",
+        "2026-09-01T00:00:00",
+        "2026-09-01 00:00:01.",
+        "x",
+    ] {
+        assert_eq!(
+            timestamp(text).ok(),
+            NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f").ok(),
+            "{text}"
+        );
+    }
+}
+#[test]
+fn wider_period_reads_only_what_memory_lacks_like_a_disk_read() {
+    let f = Fixture::new();
+    let c = f.catalog();
+    let disk = result(&f, request());
+    let rows = |t: &Trends| {
+        t.series[0]
+            .raw
+            .iter()
+            .map(|r| {
+                (
+                    r.time(),
+                    r.row_id,
+                    r.value.to_bits(),
+                    r.flags,
+                    t.sources[r.source as usize].clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let key = |p: &Option<Sample>| p.as_ref().map(|p| (p.at, p.row_id, p.stamp.clone()));
+    // Same start (whole first archive in memory) and later start (previous record re-read).
+    for (start, end) in [
+        ("2026-09-01 00:00:00", "2026-09-02 00:00:00"),
+        ("2026-09-01 00:00:01", "2026-09-01 12:00:00"),
+    ] {
+        let mut part = request();
+        part.start = timestamp(start).unwrap();
+        part.end = timestamp(end).unwrap();
+        let known = result(&f, part);
+        let wide = extend(&c, request(), &known, cancel(), &|_| {}).unwrap();
+        let (d, w) = (&disk.series[0], &wide.series[0]);
+        assert!(wide.raw && wide.reused == known.series[0].count && wide.reused > 0);
+        assert_eq!((w.count, w.valid_count), (d.count, d.valid_count));
+        assert_eq!((w.minimum, w.maximum), (d.minimum, d.maximum));
+        assert_eq!(rows(&wide), rows(&disk));
+        assert_eq!(key(&w.last), key(&d.last));
+        assert_eq!(key(&w.previous), key(&d.previous));
+        assert_eq!(wide.coverage, disk.coverage);
+    }
+    // A load that does not fit (other signals) is read whole.
+    let mut other = request();
+    other.tags = vec!["RUN".into()];
+    let known = result(&f, other);
+    let wide = extend(&c, request(), &known, cancel(), &|_| {}).unwrap();
+    assert_eq!((wide.reused, rows(&wide)), (0, rows(&disk)));
+}
+#[test]
+fn time_limit_follows_progress_within_a_total_cap() {
+    let ms = Duration::from_millis;
+    let idle = Deadline::new(ms(300), Duration::from_secs(60));
+    std::thread::sleep(ms(200));
+    idle.progress();
+    std::thread::sleep(ms(200));
+    assert!(check(&AtomicBool::new(false), &idle).is_ok());
+    std::thread::sleep(ms(250));
+    assert!(check(&AtomicBool::new(false), &idle).is_err());
+    let total = Deadline::new(Duration::from_secs(60), ms(100));
+    std::thread::sleep(ms(150));
+    total.progress();
+    assert!(check(&AtomicBool::new(false), &total).is_err());
+}
+#[test]
+fn shorter_period_is_served_from_memory_like_a_disk_read() {
+    let f = Fixture::new();
+    let full = result(&f, request());
+    let mut short = request();
+    short.start = timestamp("2026-09-01 00:00:01").unwrap();
+    short.end = timestamp("2026-09-02 00:00:00").unwrap();
+    let disk = result(&f, short.clone());
+    let memory = narrow(&full, &short).unwrap();
+    let (d, m) = (&disk.series[0], &memory.series[0]);
+    assert!(memory.raw);
+    assert_eq!((m.count, m.valid_count), (d.count, d.valid_count));
+    assert_eq!((m.minimum, m.maximum), (d.minimum, d.maximum));
+    assert_eq!(
+        m.raw
+            .iter()
+            .map(|r| (r.row_id, r.value.to_bits()))
+            .collect::<Vec<_>>(),
+        d.raw
+            .iter()
+            .map(|r| (r.row_id, r.value.to_bits()))
+            .collect::<Vec<_>>()
+    );
+    let key = |p: &Option<Sample>| p.as_ref().map(|p| (p.at, p.row_id, p.value.to_bits()));
+    assert_eq!(key(&m.last), key(&d.last));
+    assert_eq!(key(&m.previous), key(&d.previous));
+    assert_eq!(memory.coverage, disk.coverage);
+    // Archive times are kept to the nanosecond, with the end excluded as on disk.
+    let mut fine = request();
+    fine.start = timestamp("2026-09-01 00:00:01.1234566").unwrap();
+    fine.end = timestamp("2026-09-01 00:00:02").unwrap();
+    assert_eq!(narrow(&full, &fine).unwrap().series[0].count, 1);
+    fine.end = timestamp("2026-09-01 00:00:01.1234567").unwrap();
+    assert_eq!(narrow(&full, &fine).unwrap().series[0].count, 0);
+    // Wider periods, other sources and signals not loaded go to disk.
+    let mut wider = request();
+    wider.end = timestamp("2026-09-04 00:00:00").unwrap();
+    let mut weekly = short.clone();
+    weekly.mode = Mode::Weekly;
+    let mut other = short.clone();
+    other.tags = vec!["RUN".into()];
+    for r in [wider, weekly, other] {
+        assert!(narrow(&full, &r).is_none());
+    }
 }
 #[test]
 fn nanosecond_precision_and_exclusive_end() {
@@ -173,7 +326,7 @@ fn raw_database_is_unchanged_and_read_only() {
     let p = f.folder.join("Day_2026-09-01.s3db");
     let before = fs::read(&p).unwrap();
     result(&f, request());
-    let con = connect(&p, cancel(), Instant::now() + Duration::from_secs(5)).unwrap();
+    let con = connect(&p, cancel(), &deadline()).unwrap();
     assert!(con.execute("DELETE FROM TagValue", []).is_err());
     assert!(
         con.query_row("PRAGMA hard_heap_limit", [], |r| r.get::<_, i64>(0))
@@ -191,7 +344,7 @@ fn raw_database_is_unchanged_and_read_only() {
 #[test]
 fn wal_archive_and_unusual_path_leave_no_side_files() {
     let f = Fixture::new();
-    let folder = f.folder.join("odd #1 %20 è");
+    let folder = f.folder.join("odd #1 %20 Ã¨");
     fs::create_dir(&folder).unwrap();
     for name in [
         "Day_2026-09-01.s3db",
@@ -266,10 +419,11 @@ fn cancellation_and_sqlite_deadline_interrupt_work() {
             .unwrap_err()
             .contains("cancelled")
     );
+    let short = Duration::from_millis(10);
     let con = connect(
         &f.folder.join("Day_2026-09-01.s3db"),
         cancel(),
-        Instant::now() + Duration::from_millis(10),
+        &Deadline::new(short, short),
     )
     .unwrap();
     let start = Instant::now();
@@ -323,7 +477,7 @@ fn untrusted_metadata_and_views_are_rejected() {
     con.execute_batch("DROP TABLE TagConfig; CREATE VIEW TagConfig AS SELECT 1 AS Id;")
         .unwrap();
     drop(con);
-    assert!(connect(&path, cancel(), Instant::now() + Duration::from_secs(5)).is_err());
+    assert!(connect(&path, cancel(), &deadline()).is_err());
 }
 
 #[test]
@@ -365,9 +519,9 @@ fn worker_latest_request_wins_and_recovers_after_error() {
     };
     let mut bad = request();
     bad.tags = vec!["UNKNOWN".into()];
-    manager.submit(Job::Load(c.clone(), bad));
+    manager.submit(Job::Load(c.clone(), bad, None));
     assert!(wait(&manager).is_err());
-    manager.submit(Job::Load(c, request()));
+    manager.submit(Job::Load(c, request(), None));
     let Loaded::Trends(t) = wait(&manager).unwrap() else {
         panic!("trends expected")
     };
