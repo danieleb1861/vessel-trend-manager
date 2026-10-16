@@ -77,7 +77,9 @@ DG1-LO-P;3.9;6;bar;lube oil pressure
 
 - `tag` is the exact signal name in the archive; rows without a tag are ignored, `#` starts a comment.
 - `min` or `max` may be empty; decimals with point or comma. If `unit` is filled it must match
-  the archive unit exactly, including case (`mW` differs from `MW`), otherwise the limits of that signal are not drawn.
+  the archive unit, including case (`mW` differs from `MW`), otherwise the limits of that signal
+  are not drawn and a message shows both units. Spellings that cannot be confused are accepted
+  in any case: `kW`, `kWh`, `kVA`, `kvar`, `kV`, `kA`, `kPa`, `Hz`, `rpm`, `bar`, `°C`.
 - The file opens and saves directly in Excel (UTF-8 or Windows CSV). Saved edits appear in the
   charts within seconds, without reloading. An unreadable update clears the displayed limits
   and reports an error; limits without units carry a verification warning.

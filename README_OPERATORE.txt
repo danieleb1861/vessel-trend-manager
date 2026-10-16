@@ -100,8 +100,12 @@ Il file si apre e si modifica direttamente con Excel: salvare con Salva,
 mantenendo il formato CSV. Dopo il salvataggio i grafici si aggiornano da soli.
 Il tag e il nome esatto del parametro nell'archivio. Min o max possono
 restare vuoti; se l'unita e indicata deve coincidere con quella dell'archivio.
-Maiuscole e minuscole contano: mW e MW sono unita diverse. Senza unita compare
-un avviso di verifica. Se il file diventa illeggibile, i limiti vengono rimossi
+Maiuscole e minuscole contano: mW e MW sono unita diverse. Se l'unita non
+coincide, il messaggio mostra quella del file e quella dell'archivio; passando
+il mouse sul messaggio compare il nome del file dei limiti in uso. Sono accettate
+in qualsiasi scrittura le unita che non si possono confondere: kW, kWh, kVA,
+kvar, kV, kA, kPa, Hz, rpm, bar, °C (per esempio KW vale come kW).
+Senza unita compare un avviso di verifica. Se il file diventa illeggibile, i limiti vengono rimossi
 dal grafico e compare un errore: correggere il file o importarlo nuovamente.
 I limiti sintetici vengono caricati automaticamente solo aprendo la demo.
 Le righe che iniziano con # e quelle senza tag sono ignorate.

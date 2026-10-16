@@ -70,8 +70,19 @@ struct Limit {
 impl Limit {
     fn matches_unit(&self, unit: &str) -> bool {
         // SI prefixes are case-sensitive: mW and MW differ by a factor of a billion.
-        self.unit.is_empty() || self.unit == unit
+        self.unit.is_empty() || canonical_unit(&self.unit) == canonical_unit(unit)
     }
+}
+/// Unit spellings that differ only in case, folded where no prefix can be confused: kilo is
+/// only `k` and `K` is not a prefix, so `KW` is `kW`. `mW`/`MW` or `mbar`/`Mbar` stay distinct.
+fn canonical_unit(unit: &str) -> &str {
+    const FOLDED: [&str; 11] = [
+        "kW", "kWh", "kVA", "kvar", "kV", "kA", "kPa", "Hz", "rpm", "bar", "°C",
+    ];
+    FOLDED
+        .into_iter()
+        .find(|u| u.eq_ignore_ascii_case(unit))
+        .unwrap_or(unit)
 }
 fn read_small_file(path: &Path) -> std::io::Result<Vec<u8>> {
     const MAX_BYTES: u64 = 1_048_576;
@@ -1566,7 +1577,11 @@ impl App {
                         });
                     } else {ui.colored_label(MUTED,t("No readings in the period. No data does not mean zero.","Nessuna lettura nel periodo. Nessun dato non significa zero."));}
                     if let Some(prior)=&series.previous {ui.small(tr!("Previous record: {} (does not confirm the state in the period)","Record precedente: {} (non conferma lo stato nel periodo)",prior.stamp));}
-                    if let Some(l)=mismatch {ui.colored_label(Color32::from_rgb(155,94,20),tr!("Machinery limits ignored: unit {} differs from the archive.","Limiti dei macchinari ignorati: unita {} diversa dall'archivio.",l.unit));}
+                    if let Some(l)=mismatch {
+                        let file=self.limits_file.as_ref().and_then(|(p,_)|p.file_name()).map(|n|n.to_string_lossy().into_owned()).unwrap_or_default();
+                        ui.colored_label(Color32::from_rgb(155,94,20),tr!("Machinery limits ignored for {}: unit «{}» in the limits file, «{}» in the archive. Case matters (mW ≠ MW): correct the limits file.","Limiti dei macchinari ignorati per {}: unita «{}» nel file dei limiti, «{}» nell'archivio. Le maiuscole contano (mW ≠ MW): correggere il file dei limiti.",series.tag.name,l.unit,series.tag.unit))
+                            .on_hover_text(tr!("Limits file: {}","File dei limiti: {}",file));
+                    }
                     if limit.is_some_and(|l|l.unit.is_empty()) && !series.tag.unit.is_empty() {ui.colored_label(Color32::from_rgb(155,94,20),t("Limits have no unit: verify against the archive before use.","Limiti senza unita: verificarli rispetto all'archivio prima dell'uso."));}
                     let start=trends.request.start.and_utc().timestamp() as f64;
                     let end=trends.request.end.and_utc().timestamp() as f64;
@@ -1932,6 +1947,12 @@ mod tests {
         let limits = parse_limits("POWER;;5;MW").unwrap();
         assert!(limits["POWER"].matches_unit("MW"));
         assert!(!limits["POWER"].matches_unit("mW"));
+        // Only spellings that cannot be confused fold together.
+        let limits = parse_limits("A;;5;KW\nB;;5;mbar\nC;;5;°c\nD;;5;RPM").unwrap();
+        assert!(limits["A"].matches_unit("kW") && limits["A"].matches_unit("kw"));
+        assert!(!limits["A"].matches_unit("kWh"));
+        assert!(!limits["B"].matches_unit("Mbar") && !limits["B"].matches_unit("bar"));
+        assert!(limits["C"].matches_unit("°C") && limits["D"].matches_unit("rpm"));
         let options = Options {
             smoke: true,
             ..Default::default()
