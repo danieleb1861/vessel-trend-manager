@@ -48,6 +48,6 @@ body:
     id: version
     attributes:
       label: Version and Windows build
-      placeholder: "e.g. 0.2.0, Windows 11 24H2"
+      placeholder: "e.g. 0.4.0, Windows 11 24H2"
     validations:
       required: true

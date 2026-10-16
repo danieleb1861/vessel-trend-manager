@@ -44,6 +44,7 @@ is required. Other operating systems have not been tested.
 | Analysis of the visible range | `src/gui.rs`: `Summary`, `measure`, `span`, `save_csv`, `csv_cell` |
 | Isolation Forest | `src/gui.rs`: `Forest`, `reading_features`, `threshold`, `train_forest`, `unusual_readings`, `FOREST_*` |
 | Jev-style pattern classifier | `src/gui.rs`: `PATTERNS`, `pattern_features`, `synthetic_patterns`, `PatternModel`, `classify_pattern`; trained only on synthetic windows |
+| Machinery limits | `src/gui.rs`: `parse_limits`, `read_limits`, `Limit::matches_unit`, `canonical_unit` |
 | Memory reuse of loaded readings | `src/archive.rs`: `narrow`, `extend`, `Series::absorb`; `src/gui.rs`: `App::cache` |
 | Quick periods | `src/gui.rs`: `PERIODS`, `set_period` |
 | New data schema | `src/archive.rs`: `scan`, `load`, `TAG_SQL`, `sample`, `nominal` |
@@ -72,18 +73,29 @@ Archive workers retain at most one batch of four partial results. Input caps are
 20,000 archive files, 10,000 catalog entries, 1,024 UTF-8 bytes per metadata field
 and 10,000 dynamic IDs per signal. SQLite uses a shared 64 MiB hard heap limit and
 memory-only temporary storage. Views and triggers are disabled; expected archive
-objects must be ordinary tables. These are defensive rejection limits, not a cap
-on the entire GUI process. Reassess them with synthetic fixtures when adapting a schema.
+objects must be ordinary tables. These defensive limits reject oversized input;
+the GUI process as a whole has no memory cap. Reassess them with synthetic fixtures when adapting a schema.
 
 If `MAX_TAGS` is increased, also adapt the `COLORS` palette, texts and GUI
-layout. Test limit increases on the target PC. Operating limits for signals
-are a future local configuration of the vessel.
+layout. Test limit increases on the target PC.
+
+Machinery operating limits are a local CSV file `tag;min;max;unit;notes`,
+imported with "Machinery limits..." and never published (`parse_limits`,
+`read_limits`). A limit is drawn only when its unit, if given, matches the
+archive unit (`Limit::matches_unit`). Units are case-sensitive (mW and MW differ);
+`canonical_unit` folds only kW, kWh, kVA, kvar, kV, kA, kPa, Hz, rpm, bar, °C.
+
+The Isolation Forest and the pattern classifier run offline in the GUI thread,
+only on readings already in memory (no SQLite), with fixed seeds. The forest is
+trained on demand on at most 20,000 readings of one signal; the classifier is
+trained once (`OnceLock`) on synthetic windows from `synthetic_patterns`.
+Their outputs are exploratory labels for the operator to verify; test changes with synthetic data only.
 
 ## Adapting another vessel
 
 With the same AMS export schema and standard names, just choose the new archives.
 The tables used are `TagConfig`, `TagType`, `AlarmGroup`, `TagConfigDynamic`
-and `TagValue`. The group link uses `AlarmGroupNumber`, not `Id`.
+and `TagValue`. The group link uses `AlarmGroupNumber`; `Id` is only the row key.
 `TagValue` holds timestamp, value and quality flags; aggregates also have
 `Min`, `Max` and `IntervalMarker`.
 
@@ -119,9 +131,11 @@ The exit code must be zero. `--tags A,B` chooses the signals;
 Without explicit tags the checks choose four analog signals.
 
 Manually check search, scrolling, zoom, cancellation, views, readability and
-both languages. Zoom alone does not reread the data: narrow From/To and reload.
+both languages. Daily loads up to `MAX_RAW` (2 million readings) keep the raw
+readings, so zoom and pan draw from memory (`RawView`). Above that cap the view
+is reduced (orange warning): narrow From/To and reload to see every reading.
 Reduced digital signals are not joined to invent durations; native samples more
-than 15 minutes apart are not connected. This plotting choice is not a diagnosis.
+than 15 minutes apart are not connected. This is a plotting choice and carries no diagnosis.
 
 ## Rebuilding and distributing the executable
 
@@ -162,7 +176,7 @@ are also read from the former Python version. The file can contain local data.
 
 ## Publication
 
-Use this folder as the repository, never the exports folder.
+Use this folder as the repository and keep the exports folder outside it.
 `.gitignore` and `publicTrend` in `build.ps1` allow only the listed files:
 update them together when adding a public file. Check
 `git status --short` and `git diff --cached`; files already tracked and history
@@ -172,9 +186,24 @@ Exclude real data, screenshots, preferences, operating configurations, vessel
 names, personal paths, logs, `.private`, `.rust`, `target` and `dist`.
 Rules for automated coding agents are in [AGENTS.md](AGENTS.md).
 The script collects the dependency licenses. New dependencies and executables
-must be reviewed before distribution. The project is MIT-licensed (`LICENSE`);
-publication authorization is still to be confirmed. No automatic upload.
+must be reviewed before distribution. The project is MIT-licensed (`LICENSE`)
+and public on GitHub with releases. No script uploads anything automatically.
+
+Release procedure, by the maintainer only:
+
+1. Bump `version` in `Cargo.toml`; `Cargo.lock` changes only the package's own
+   entry. Verify with `cargo metadata --locked --offline`.
+2. Commit as "Release X.Y.Z".
+3. Move any `preferenze.json` out of `dist`, run `.\build.ps1` and check the
+   SHA256 files against the ZIPs.
+4. Create the annotated tag `vX.Y.Z` on that commit.
+5. Scan the new commits for personal data, then push the commit and the tag.
+6. Create the GitHub release with the four `dist` files: the two ZIPs and the
+   two `.sha256` files.
+
+Commits, tags and release notes carry only the maintainer's name, with no AI
+attribution or `Co-authored-by` trailers.
 
 References: [eframe](https://docs.rs/eframe/0.33.3/eframe/),
-[rusqlite](https://docs.rs/rusqlite/0.37.0/rusqlite/),
+[rusqlite](https://docs.rs/rusqlite/0.40.2/rusqlite/),
 [local Rustup](https://rust-lang.github.io/rustup/installation/index.html).

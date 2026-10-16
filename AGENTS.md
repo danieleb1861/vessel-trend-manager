@@ -13,8 +13,8 @@ No network access, no live acquisition, archives opened read-only.
 | File | Responsibility |
 |---|---|
 | `src/main.rs` | Startup, CLI options, UI language (`tr!`, `t`) |
-| `src/gui.rs` | GUI, plotting, saved views |
-| `src/archive.rs` | Read-only archive reader, reduction, background worker |
+| `src/gui.rs` | GUI, plotting, saved views, visible-range analysis, offline ML helpers |
+| `src/archive.rs` | Read-only archive reader, raw readings and reduction, memory reuse, background worker |
 | `src/demo.rs` | Deterministic synthetic demo archives (`--demo`, Try demo) |
 | `src/tests.rs` | Synthetic-data regression tests |
 | `build.rs`, `build.ps1` | Windows resources; release build and allowlisted packages |

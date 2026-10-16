@@ -1,8 +1,8 @@
 VESSEL TREND MANAGER - GUIDA PER L'OPERATORE
 
 Consulta i trend dei macchinari dagli export .s3db del sistema AMS, su un PC
-separato. I dati arrivano fino all'ultimo export disponibile: non e un
-collegamento in tempo reale. Il programma non modifica i database.
+separato. I dati arrivano fino all'ultimo export disponibile e si aggiornano
+copiando i nuovi export. Il programma non modifica i database.
 
 PRIMO AVVIO
 1. Copiare lo ZIP sul PC e scegliere Estrai tutto.
@@ -31,7 +31,7 @@ CARICARE UN TREND
 VEDERE PERIODI PIU VECCHI O PIU LUNGHI
 Non c'e un limite fisso di 30 giorni. Si possono inserire date passate
 oppure usare Tutto lo storico della sorgente selezionata.
-I periodi rapidi terminano all'ultima lettura disponibile, non all'ora del PC.
+I periodi rapidi terminano all'ultima lettura disponibile nell'archivio.
 Se esistono solo export settimanali per un periodo vecchio, scegliere
 Settimanali: il programma non ricrea letture giornaliere mancanti.
 
@@ -47,12 +47,14 @@ Ridurre parametri o periodo, oppure usare i settimanali per una vista
 d'insieme. Non viene mostrato un risultato parziale come completo.
 Un periodo piu breve degli stessi parametri gia caricati arriva subito
 dalla memoria. Per un periodo piu ampio vengono letti solo gli archivi
-mancanti: si puo quindi allargare il periodo a passi successivi.
+mancanti e lo stato indica quante letture arrivano (N dalla memoria):
+si puo quindi allargare il periodo a passi successivi.
 La memoria si svuota scegliendo un'altra cartella dati o premendo Aggiorna.
 
 LEGGERE IL GRAFICO
 - Controllare data e ora dell'ultima lettura sopra ciascun grafico.
-  Un dato vecchio non e una misura attuale; nessun dato non significa zero.
+  Un dato vecchio descrive il momento della registrazione; un tratto senza
+  dati indica letture mancanti, con valore sconosciuto.
 - Passare il mouse sul grafico per vedere nel riquadro valore, unita,
   timestamp, file e riga di origine della lettura piu vicina.
 - Usare la rotella per lo zoom e trascinare con il pulsante sinistro per
@@ -60,13 +62,16 @@ LEGGERE IL GRAFICO
   trascinare un rettangolo per ingrandire una zona.
 - Salva schermata salva un'immagine PNG della finestra visibile. La schermata
   puo contenere nomi di impianti, letture e percorsi: conservarla localmente.
-  Scegliere un nome nuovo con estensione .png: i file esistenti non vengono sovrascritti.
+  Scegliere un nome nuovo con estensione .png: i file esistenti non
+  vengono sovrascritti.
 - Con i giornalieri il programma tiene in memoria tutte le letture raw
   (fino a 2 milioni per caricamento). Ingrandendo con lo zoom compaiono
   tutte le letture; da lontano ogni colonna di pixel mostra prima, ultima,
   minima e massima lettura reale, quindi i picchi restano visibili.
   Oltre 2 milioni compare l'avviso Vista ridotta: per vedere ogni lettura
   restringere Da/A o i parametri e premere nuovamente Carica trend.
+- Con i settimanali i punti sono gli aggregati dell'archivio e le barre
+  verticali ne mostrano minimo e massimo: lo zoom non aggiunge dettaglio.
 - Tacche arancio: letture non valide o forzate, escluse dalla curva.
 - Tacche rosse: flag di allarme gia registrati dal sistema AMS.
 - Tacche viola: flag di inibizione gia registrati.
@@ -85,17 +90,22 @@ e segue zoom e spostamenti:
   conteggi: il programma non calcola ore di moto o durate.
 - Istogramma: apre sotto il grafico la distribuzione delle letture valide.
 - Misura: clic destro su una lettura (A) e su una seconda (B) per leggere
-  intervallo di tempo, variazione e variazione all'ora. I punti sono letture
-  registrate, mai valori calcolati. La x cancella la misura.
-- Anomalie (parametri analogici): un modello Isolation Forest, addestrato
-  sulle letture caricate di quel parametro (valore e variazione all'ora),
-  cerchia in rosso lo 0,5% di letture piu insolite tra quelle disegnate.
-  E un'indicazione da approfondire, non un allarme: non conosce i limiti e
-  impara da cio che e stato caricato, compresi eventuali guasti.
-- Andamento (parametri analogici): un piccolo classificatore indica le due
-  descrizioni piu probabili del tratto visibile tra stabile, deriva,
-  gradino, picchi e bloccato, con la probabilita. E addestrato solo su dati
-  sintetici: e un'indicazione da verificare sul grafico, non un allarme.
+  intervallo di tempo, variazione e variazione all'ora. I punti sono sempre
+  letture registrate. La x cancella la misura. Trascinare un
+  rettangolo con il pulsante destro continua a ingrandire una zona.
+- Anomalie (parametri analogici, pulsante da attivare): un modello
+  Isolation Forest, addestrato sulle letture caricate di quel parametro
+  (valore e variazione all'ora), cerchia in rosso lo 0,5% di letture piu
+  insolite tra quelle disegnate.
+  E un'indicazione da approfondire sul grafico: ignora i limiti e impara
+  da cio che e stato caricato, compresi eventuali guasti.
+- Andamento (indicativo), parametri analogici: un piccolo classificatore
+  indica le due descrizioni piu probabili tra stabile, deriva, gradino,
+  picchi e bloccato, con la probabilita. Valuta tutto il tratto visibile,
+  dal bordo sinistro a quello destro: per giudicare
+  il comportamento piu recente ingrandire l'ultima parte del grafico.
+  E addestrato solo su dati sintetici: e un'indicazione da verificare sul
+  grafico.
 - Esporta CSV: salva le letture raw visibili (data e ora, valore, unita,
   validita, allarme, inibizione, file e riga) in un file per Excel, separato
   da punto e virgola, con la virgola decimale in italiano. Scegliere un nome
@@ -106,30 +116,36 @@ LIMITI DEI MACCHINARI
 Limiti macchinari... importa un file CSV con una riga per parametro:
   tag;min;max;unita;note
 Il file si apre e si modifica direttamente con Excel: salvare con Salva,
-mantenendo il formato CSV. Dopo il salvataggio i grafici si aggiornano da soli.
+mantenendo il formato CSV. Dopo il salvataggio i grafici si aggiornano
+da soli.
 Il tag e il nome esatto del parametro nell'archivio. Min o max possono
-restare vuoti; se l'unita e indicata deve coincidere con quella dell'archivio.
-Maiuscole e minuscole contano: mW e MW sono unita diverse. Se l'unita non
-coincide, il messaggio mostra quella del file e quella dell'archivio; passando
-il mouse sul messaggio compare il nome del file dei limiti in uso. Sono accettate
-in qualsiasi scrittura le unita che non si possono confondere: kW, kWh, kVA,
-kvar, kV, kA, kPa, Hz, rpm, bar, °C (per esempio KW vale come kW).
-Senza unita compare un avviso di verifica. Se il file diventa illeggibile, i limiti vengono rimossi
-dal grafico e compare un errore: correggere il file o importarlo nuovamente.
+restare vuoti; se l'unita e indicata deve coincidere con quella
+dell'archivio. Maiuscole e minuscole contano: mW e MW sono unita diverse.
+Se l'unita non coincide, i limiti di quel parametro sono ignorati e il
+messaggio indica il parametro, l'unita del file e quella dell'archivio;
+passando il mouse sul messaggio compare il nome del file dei limiti in
+uso. Sono accettate in qualsiasi scrittura le unita che non si possono
+confondere: kW, kWh, kVA, kvar, kV, kA, kPa, Hz, rpm, bar, °C (per esempio
+KW vale come kW). Senza unita compare un avviso di verifica.
+Se il file diventa illeggibile, i limiti vengono rimossi dal grafico e
+compare un errore: correggere il file o importarlo nuovamente.
 I limiti sintetici vengono caricati automaticamente solo aprendo la demo.
 Le righe che iniziano con # e quelle senza tag sono ignorate.
 Un limite compare nel grafico quando e vicino ai valori letti, oppure
 allontanando lo zoom con la rotella: la scala non viene allargata per
 limiti lontani. Oltre il limite la zona e ombreggiata in rosso, con una
-linea tratteggiata sul limite. Sono i limiti inseriti dall'utente, non le
-soglie di allarme del sistema AMS. Il file resta sul PC: non condividerlo.
+linea tratteggiata sul limite. Sono i limiti inseriti dall'utente, distinti
+dalle soglie di allarme del sistema AMS. Il file resta sul PC: non condividerlo.
 
 VISTE ABITUALI
 Scegliere parametri, sorgente e periodo; in Viste abituali scrivere
-un nome, per esempio Motore A - temperature, e premere Salva. Richiamando la vista
-si caricano gli stessi parametri e la stessa durata sui dati piu recenti.
+un nome, per esempio Motore A - temperature, e premere Salva.
+Richiamando la vista si caricano gli stessi parametri e la stessa durata
+sui dati piu recenti.
 Una vista salvata con Tutto lo storico comprende anche i nuovi archivi
-aggiunti successivamente. Le preferenze restano nella cartella del programma.
+aggiunti successivamente. Le preferenze restano nel file preferenze.json
+nella cartella del programma. Installando una nuova versione in un'altra
+cartella, copiare preferenze.json dalla vecchia con il programma chiuso.
 
 NUOVI EXPORT
 Copiare gli export in days e weeks mantenendo i nomi originali
@@ -151,3 +167,11 @@ PROBLEMI COMUNI
 - Vista non salvata: usare una cartella del programma scrivibile dall'utente.
 Se il problema rimane, comunicare al referente messaggio esatto, parametro,
 periodo e sorgente selezionati.
+
+COSA C'E DI NUOVO NELLA 0.4.0
+- Anomalie: per i parametri analogici cerchia in rosso le letture piu
+  insolite tra quelle disegnate (Isolation Forest sui dati caricati).
+- Andamento (indicativo): stabile, deriva, gradino, picchi o bloccato,
+  valutato su tutto il tratto visibile.
+Entrambi sono indicazioni esplorative da verificare sul grafico: vedere
+ANALISI DEL TRATTO VISIBILE.

@@ -14,5 +14,6 @@
 
 - [ ] No real archives, values, tag lists, vessel identities, screenshots, preferences or personal paths
 - [ ] New GUI texts have English and Italian versions (`t()` / `tr!`)
+- [ ] Analysis or ML changes use synthetic data and fixed seeds, and label outputs as exploratory hints to verify
 - [ ] New public files added to both `.gitignore` and `publicTrend` in `build.ps1`
 - [ ] Dependency changes (if any) explained, with `Cargo.lock` and licenses reviewed

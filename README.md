@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>Offline trend viewer for ship machinery archives.</b><br>
-  Months of alarm-and-monitoring-system (AMS) history in a few clicks: one portable <code>.exe</code>, no install, no network, read-only.
+  Months of alarm-and-monitoring-system (AMS) history in a few clicks, every raw reading, with light offline analysis: one portable <code>.exe</code>, no install, no network, read-only.
 </p>
 
 <p align="center">
@@ -29,9 +29,10 @@
 ## Why
 
 Machinery data on board usually sits in daily and weekly SQLite exports that nobody
-opens: the AMS console shows hours, not months. Vessel Trend Manager turns those
+opens: the AMS console shows only the last hours. Vessel Trend Manager turns those
 exports into searchable, zoomable trends on a separate PC, so slow drifts and trends become
-visible before they become alarms.
+visible before they become alarms. Small statistical and machine-learning helpers point at
+what deserves a closer look, always next to the readings they come from.
 
 ## Features
 
@@ -39,8 +40,9 @@ visible before they become alarms.
 |---|---|
 | **Every raw reading** | Daily loads keep up to 2 million raw readings in memory; zoom and pan draw the visible range from them, every reading when it fits, otherwise the real first, last, min and max per pixel column. Larger loads fall back to ≤ 800 buckets with the same rule, with a visible warning. |
 | **Fast on large histories** | Background, cancellable, parallel reads. A shorter period of loaded signals comes from memory; a wider one reads only the archives that memory lacks. |
-| **Light analysis** | For the visible range: count, valid share, min, max, mean and σ; digital state changes (counts, no durations); histogram; right-click measure of Δt, Δ and rate per hour between two readings; Isolation Forest marks for unusual readings; Jev-style pattern classifier; CSV export of the raw readings for Excel. |
-| **Honest plots** | Invalid, overridden, alarm and inhibit flags are marked; gaps and missing archives are shaded, never interpolated. |
+| **Light analysis** | For the visible range: count, valid share, min, max, mean and σ; digital state changes (counts, no durations); histogram; right-click measure of Δt, Δ and rate per hour between two readings; CSV export of the raw readings for Excel. |
+| **Offline machine learning** | An Isolation Forest circles unusual readings and a Jev-style classifier labels the visible range (stable, drift, step, spikes, stuck) with probabilities. Pure Rust, no dependencies, trained in the app in milliseconds; their marks are hints to verify on the chart. |
+| **Honest plots** | Invalid, overridden, alarm and inhibit flags are marked; gaps and missing archives are shaded and left empty. |
 | **Machinery operating limits** | Min/max limits from a CSV file editable in Excel; the zone beyond each limit is shaded, with no rescaling for far limits. |
 | **Daily and weekly sources kept apart** | Raw readings and weekly min/max aggregates (drawn as range bars) are never mixed. |
 | **Built for operators** | Search by system, signal or tag; up to four signals; saved views; PNG screenshots; English/Italian switch. |
@@ -86,7 +88,7 @@ DG1-LO-P;3.9;6;bar;lube oil pressure
 - Limits close to the readings are brought into view; far limits do not rescale the chart and
   appear when zooming out. The demo ships with `SYNTHETIC_DEMO_LIMITS.csv`.
 
-Limits are user-entered values, not AMS alarm thresholds. Keep real limit files local: like
+Limits are values entered by the user, separate from the AMS alarm thresholds. Keep real limit files local: like
 archives and preferences, they are never part of the repository or the release package.
 Synthetic limits load automatically only after explicitly opening the demo. Screenshots
 and CSV exports require a new filename and never overwrite an existing file; CSV exports
@@ -105,13 +107,16 @@ follows zoom and pan:
   per hour. Points snap to recorded readings; nothing is interpolated.
 - **Unusual** (analog signals): an Isolation Forest (Liu, Ting and Zhou, 2008) on value and
   change per hour, trained in the app on the signal's loaded readings (at most 20,000, fixed
-  seed), circles the most unusual 0.5% among the readings drawn. Exploratory, not an alarm:
-  it knows no limits and learns from whatever was loaded, faults included.
+  seed), circles the most unusual 0.5% among the readings drawn. Treat its marks as hints to
+  verify: it ignores machinery limits and learns from whatever was loaded, faults included.
 - **Pattern** (analog signals): a Jev-style classifier answers "how does this signal behave over
-  the shown range?" with fixed labels and probabilities: stable, drift, step, spikes, stuck. It is
+  the shown range?" with fixed labels and probabilities: stable, drift, step, spikes, stuck. It
+  judges the whole visible range from edge to edge; zoom on the last part to judge recent
+  behaviour. It is
   a small multinomial logistic regression on nine scale-free features (Theil–Sen trend, linearity,
   best two-segment split, robust spikes, flatness, roughness, …), trained in the app on synthetic
-  windows only, in milliseconds. Exploratory, not calibrated on real vessels, not an alarm.
+  windows only, in milliseconds. Its probabilities hold for synthetic data: use them as hints
+  to verify on the real readings.
 - **Export CSV**: the raw readings shown, with time to the nanosecond, value, unit, validity,
   alarm and inhibit flags, archive file and row; `;` separated, decimal comma in Italian,
   UTF-8 for Excel. Archive text is written so Excel never reads it as a formula.
@@ -146,7 +151,7 @@ flowchart LR
     A[".s3db archives<br/>days/ · weeks/"] -->|"read-only · query_only<br/>defensive SQLite"| B["scan()<br/>catalog of tags,<br/>groups and coverage"]
     B --> C["load() / extend()<br/>≤ 4 signals · ≤ 50 M rows<br/>120 s without progress · 600 s in all<br/>parallel per archive"]
     C -->|"≤ 2 M raw readings"| R["memory cache<br/>shorter periods · wider periods<br/>read only what is missing"]
-    R --> D["RawView<br/>visible range per pixel<br/>statistics · histogram"]
+    R --> D["RawView<br/>visible range per pixel<br/>statistics · histogram<br/>Isolation Forest · pattern classifier"]
     C -->|"over the cap: ≤ 800 buckets<br/>first · last · min · max"| P["CachedPlot"]
     D --> E["egui GUI<br/>EN / IT"]
     P --> E
@@ -158,7 +163,7 @@ SQLite never runs in the GUI loop. Every request is bounded in signals, rows and
 (it stops after 120 s without progress or 600 s in all), and a newer request cancels the
 older one. The memory cache is dropped when the archive folder is closed or reopened.
 
-The viewer is an aid for historical analysis, not a live alarm or certified safety system.
+The viewer is an aid for historical analysis; live alarms and safety functions remain with the AMS.
 Use closed exports on a local disk; network shares can cause Windows network traffic even
 though the application has no network client. Read-only access does not authenticate an export.
 SQLite has a shared 64 MiB heap cap; catalogs, text fields and pending archive results are
@@ -191,7 +196,7 @@ successful build, and any other file in `dist` stops the build without deleting 
 | File | Responsibility |
 |---|---|
 | `src/main.rs` | Startup, CLI, UI language |
-| `src/gui.rs` | GUI, plotting, saved views, machinery limits, analysis of the visible range |
+| `src/gui.rs` | GUI, plotting, saved views, machinery limits, analysis of the visible range, Isolation Forest, pattern classifier |
 | `src/archive.rs` | Read-only reader, raw readings and reduction, memory reuse, background worker |
 | `src/demo.rs` | Deterministic synthetic archives and limits |
 | `src/tests.rs` | Regression tests on synthetic data |

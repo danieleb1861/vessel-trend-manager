@@ -32,6 +32,11 @@ For another archive format, preserve the `scan`/`load` boundary in `src/archive.
 [MAINTAINING.md](MAINTAINING.md). Avoid duplicating the GUI or embedding machinery
 names from a particular vessel. Query source archives in read-only mode.
 
+For analysis or ML changes (range summary, Isolation Forest, pattern classifier),
+use synthetic data and fixed seeds only, and keep tests deterministic. Keep the
+outputs labelled as exploratory hints to verify; never infer durations or units.
+Add no dependency without the maintainer's approval and no network access.
+
 Keep `Cargo.lock` in version control. Review dependency changes and license files.
 Do not include local `.rust`, `.private`, `target` or `dist` folders.
 Contributions made with coding agents follow [AGENTS.md](AGENTS.md).
